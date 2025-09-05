@@ -46,6 +46,42 @@ def get_im_gt_name_dict(datasets, flag='valid'):
 
     return name_im_gt_list
 
+def get_im_instance_name_dict(datasets, flag='valid'):
+    print("------------------------------", flag, "(instance)--------------------------------")
+    name_im_gt_list = []
+
+    for i in range(len(datasets)):
+        print("--->>>", flag, " dataset ",i,"/",len(datasets)," ",datasets[i]["name"],"<<<---")
+        tmp_im_list, tmp_gt_list = [], []
+        # all images
+        all_ims = glob(datasets[i]["im_dir"]+os.sep+'*'+datasets[i]["im_ext"])
+        print('-im-',datasets[i]["name"],datasets[i]["im_dir"], ': ',len(all_ims))
+
+        if(datasets[i]["gt_dir"]==""):
+            print('-gt-', datasets[i]["name"], datasets[i]["gt_dir"], ': ', 'No Ground Truth Found')
+            tmp_gt_list = []
+        else:
+            # for each image, collect all instance mask files with same basename prefix
+            count_pairs = 0
+            for im_path in all_ims:
+                base = im_path.split(os.sep)[-1].split(datasets[i]["im_ext"])[0]
+                inst_masks = glob(datasets[i]["gt_dir"]+os.sep+base+'*'+datasets[i]["gt_ext"])
+                if len(inst_masks) == 0:
+                    continue
+                # duplicate image path for each instance mask
+                tmp_im_list.extend([im_path for _ in inst_masks])
+                tmp_gt_list.extend(inst_masks)
+                count_pairs += len(inst_masks)
+            print('-gt(instances)-', datasets[i]["name"],datasets[i]["gt_dir"], ': ',count_pairs)
+
+        name_im_gt_list.append({"dataset_name":datasets[i]["name"],
+                                "im_path":tmp_im_list,
+                                "gt_path":tmp_gt_list,
+                                "im_ext":datasets[i]["im_ext"],
+                                "gt_ext":datasets[i]["gt_ext"]})
+
+    return name_im_gt_list
+
 def create_dataloaders(name_im_gt_list, my_transforms=[], batch_size=1, training=False):
     gos_dataloaders = []
     gos_datasets = []

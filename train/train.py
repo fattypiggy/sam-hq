@@ -20,7 +20,7 @@ from typing import Dict, List, Tuple
 from segment_anything_training import sam_model_registry
 from segment_anything_training.modeling import TwoWayTransformer, MaskDecoder
 
-from utils.dataloader import get_im_gt_name_dict, create_dataloaders, RandomHFlip, Resize, LargeScaleJitter
+from utils.dataloader import get_im_gt_name_dict, get_im_instance_name_dict, create_dataloaders, RandomHFlip, Resize, LargeScaleJitter
 from utils.loss_mask import loss_masks
 import utils.misc as misc
 
@@ -303,6 +303,31 @@ def get_args_parser():
     parser.add_argument('--visualize', action='store_true')
     parser.add_argument("--restore-model", type=str,
                         help="The path to the hq_decoder training checkpoint for evaluation")
+    parser.add_argument('--vis-branch', type=str, default='auto', choices=['auto','sam','hq'],
+                        help="Which branch to visualize: 'sam' for baseline SAM, 'hq' for HQ mask, 'auto' uses 'hq' only when restore-model is provided, otherwise 'sam'.")
+
+    # Optional overrides for training/eval dataset directories and file extensions
+    parser.add_argument('--train-im-dir', type=str, default=None,
+                        help='Override training images directory (e.g., ./data/fiber/images)')
+    parser.add_argument('--train-gt-dir', type=str, default=None,
+                        help='Override training masks directory (e.g., ./data/fiber/masks)')
+    parser.add_argument('--train-im-ext', type=str, default=None,
+                        help='Override training image extension (e.g., .jpg)')
+    parser.add_argument('--train-gt-ext', type=str, default=None,
+                        help='Override training mask extension (e.g., .png)')
+
+    parser.add_argument('--eval-im-dir', type=str, default=None,
+                        help='Override evaluation images directory (e.g., ./data/fiber/images)')
+    parser.add_argument('--eval-gt-dir', type=str, default=None,
+                        help='Override evaluation masks directory (e.g., ./data/fiber/masks)')
+    parser.add_argument('--eval-im-ext', type=str, default=None,
+                        help='Override evaluation image extension (e.g., .jpg)')
+    parser.add_argument('--eval-gt-ext', type=str, default=None,
+                        help='Override evaluation mask extension (e.g., .png)')
+
+    # Instance mode
+    parser.add_argument('--instance', action='store_true',
+                        help='Enable instance-level training/evaluation: each instance mask file is a separate sample. Expects multiple mask files per image: <basename>_<instId><gt_ext>.')
 
     return parser.parse_args()
 
@@ -323,7 +348,7 @@ def main(net, train_datasets, valid_datasets, args):
     ### --- Step 1: Train or Valid dataset ---
     if not args.eval:
         print("--- create training dataloader ---")
-        train_im_gt_list = get_im_gt_name_dict(train_datasets, flag="train")
+        train_im_gt_list = (get_im_instance_name_dict if args.instance else get_im_gt_name_dict)(train_datasets, flag="train")
         train_dataloaders, train_datasets = create_dataloaders(train_im_gt_list,
                                                         my_transforms = [
                                                                     RandomHFlip(),
@@ -334,7 +359,7 @@ def main(net, train_datasets, valid_datasets, args):
         print(len(train_dataloaders), " train dataloaders created")
 
     print("--- create valid dataloader ---")
-    valid_im_gt_list = get_im_gt_name_dict(valid_datasets, flag="valid")
+    valid_im_gt_list = (get_im_instance_name_dict if args.instance else get_im_gt_name_dict)(valid_datasets, flag="valid")
     valid_dataloaders, valid_datasets = create_dataloaders(valid_im_gt_list,
                                                           my_transforms = [
                                                                         Resize(args.input_size)
@@ -581,13 +606,17 @@ def evaluate(args, net, sam, valid_dataloaders, visualize=False):
                 interm_embeddings=interm_embeddings,
             )
 
-            iou = compute_iou(masks_hq,labels_ori)
-            boundary_iou = compute_boundary_iou(masks_hq,labels_ori)
+            # Choose branch for metrics and visualization
+            use_hq = (args.vis_branch == 'hq') or (args.vis_branch == 'auto' and args.restore_model is not None)
+            masks_for_eval = masks_hq if use_hq else masks_sam
+
+            iou = compute_iou(masks_for_eval,labels_ori)
+            boundary_iou = compute_boundary_iou(masks_for_eval,labels_ori)
 
             if visualize:
                 print("visualize")
                 os.makedirs(args.output, exist_ok=True)
-                masks_hq_vis = (F.interpolate(masks_hq.detach(), (1024, 1024), mode="bilinear", align_corners=False) > 0).cpu()
+                masks_vis = (F.interpolate(masks_for_eval.detach(), (1024, 1024), mode="bilinear", align_corners=False) > 0).cpu()
                 for ii in range(len(imgs)):
                     base = data_val['imidx'][ii].item()
                     print('base:', base)
@@ -595,7 +624,7 @@ def evaluate(args, net, sam, valid_dataloaders, visualize=False):
                     imgs_ii = imgs[ii].astype(dtype=np.uint8)
                     show_iou = torch.tensor([iou.item()])
                     show_boundary_iou = torch.tensor([boundary_iou.item()])
-                    show_anns(masks_hq_vis[ii], None, labels_box[ii].cpu(), None, save_base , imgs_ii, show_iou, show_boundary_iou)
+                    show_anns(masks_vis[ii], None, labels_box[ii].cpu(), None, save_base , imgs_ii, show_iou, show_boundary_iou)
                        
 
             loss_dict = {"val_iou_"+str(k): iou, "val_boundary_iou_"+str(k): boundary_iou}
@@ -689,6 +718,30 @@ if __name__ == "__main__":
     valid_datasets = [dataset_dis_val, dataset_coift_val, dataset_hrsod_val, dataset_thin_val] 
 
     args = get_args_parser()
+
+    # Optional dataset overrides from CLI
+    if args.train_im_dir is not None and args.train_gt_dir is not None:
+        train_im_ext = args.train_im_ext if args.train_im_ext is not None else ".jpg"
+        train_gt_ext = args.train_gt_ext if args.train_gt_ext is not None else ".png"
+        train_datasets = [{
+            "name": "CUSTOM-TRAIN",
+            "im_dir": args.train_im_dir,
+            "gt_dir": args.train_gt_dir,
+            "im_ext": train_im_ext,
+            "gt_ext": train_gt_ext,
+        }]
+
+    if args.eval_im_dir is not None and args.eval_gt_dir is not None:
+        eval_im_ext = args.eval_im_ext if args.eval_im_ext is not None else ".jpg"
+        eval_gt_ext = args.eval_gt_ext if args.eval_gt_ext is not None else ".png"
+        valid_datasets = [{
+            "name": "CUSTOM-EVAL",
+            "im_dir": args.eval_im_dir,
+            "gt_dir": args.eval_gt_dir,
+            "im_ext": eval_im_ext,
+            "gt_ext": eval_gt_ext,
+        }]
+
     net = MaskDecoderHQ(args.model_type) 
 
     main(net, train_datasets, valid_datasets, args)

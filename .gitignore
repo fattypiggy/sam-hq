@@ -1,0 +1,6 @@
+__pycache__
+segment_anything.egg-info/
+train/data/*
+train/pretrained_checkpoint/*
+train/work_dirs/*
+
