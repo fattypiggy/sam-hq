@@ -15,7 +15,8 @@ from torch.autograd import Variable
 import matplotlib.pyplot as plt
 import cv2
 import random
-from typing import Dict, List, Tuple
+import shutil
+from typing import Dict, List, Tuple, Optional
 
 from segment_anything_training import sam_model_registry
 from segment_anything_training.modeling import TwoWayTransformer, MaskDecoder
@@ -23,8 +24,6 @@ from segment_anything_training.modeling import TwoWayTransformer, MaskDecoder
 from utils.dataloader import get_im_gt_name_dict, get_im_instance_name_dict, create_dataloaders, RandomHFlip, Resize, LargeScaleJitter
 from utils.loss_mask import loss_masks
 import utils.misc as misc
-
-
 
 class LayerNorm2d(nn.Module):
     def __init__(self, num_channels: int, eps: float = 1e-6) -> None:
@@ -268,6 +267,39 @@ def show_box(box, ax):
     w, h = box[2] - box[0], box[3] - box[1]
     ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='green', facecolor=(0,0,0,0), lw=2))    
 
+# save composite instances
+def save_composite_instances(ori_image_path: str, masks: List[torch.Tensor], save_path: str, alpha: float = 0.6):
+    # Read original image as RGB
+    img_bgr = cv2.imread(ori_image_path)
+    if img_bgr is None:
+        return
+    image = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    h, w = image.shape[:2]
+
+    # Prepare colors (distinct palette)
+    num = max(len(masks), 1)
+    colors = []
+    cmap = plt.get_cmap('tab20')
+    for i in range(num):
+        r, g, b, _ = cmap(i % 20)
+        colors.append((int(r * 255), int(g * 255), int(b * 255)))
+
+    overlay = image.copy()
+    for idx, m in enumerate(masks):
+        if isinstance(m, torch.Tensor):
+            m = m.cpu().numpy()
+        m = m.astype(bool)
+        color = colors[idx]
+        # Apply color where mask is True
+        overlay[m] = (np.array(color) * alpha + overlay[m] * (1 - alpha)).astype(np.uint8)
+
+    # Save
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.figure(figsize=(10,10))
+    plt.imshow(overlay)
+    plt.axis('off')
+    plt.savefig(save_path, bbox_inches='tight', pad_inches=-0.1)
+    plt.close()
 
 def get_args_parser():
     parser = argparse.ArgumentParser('HQ-SAM', add_help=False)
@@ -556,6 +588,11 @@ def evaluate(args, net, sam, valid_dataloaders, visualize=False):
         valid_dataloader = valid_dataloaders[k]
         print('valid_dataloader len:', len(valid_dataloader))
 
+        # For merged instance visualization
+        current_img_path = None
+        masks: List[torch.Tensor] = []
+        merged_save_path = None
+
         for data_val in metric_logger.log_every(valid_dataloader,1000):
             imidx_val, inputs_val, labels_val, shapes_val, labels_ori = data_val['imidx'], data_val['image'], data_val['label'], data_val['shape'], data_val['ori_label']
 
@@ -576,12 +613,6 @@ def evaluate(args, net, sam, valid_dataloaders, visualize=False):
                 input_type = random.choice(input_keys)
                 if input_type == 'box':
                     dict_input['boxes'] = labels_box[b_i:b_i+1]
-                elif input_type == 'point':
-                    point_coords = labels_points[b_i:b_i+1]
-                    dict_input['point_coords'] = point_coords
-                    dict_input['point_labels'] = torch.ones(point_coords.shape[1], device=point_coords.device)[None,:]
-                elif input_type == 'noise_mask':
-                    dict_input['mask_inputs'] = labels_noisemask[b_i:b_i+1]
                 else:
                     raise NotImplementedError
                 dict_input['original_size'] = imgs[b_i].shape[:2]
@@ -616,21 +647,55 @@ def evaluate(args, net, sam, valid_dataloaders, visualize=False):
             if visualize:
                 print("visualize")
                 os.makedirs(args.output, exist_ok=True)
-                masks_vis = (F.interpolate(masks_for_eval.detach(), (1024, 1024), mode="bilinear", align_corners=False) > 0).cpu()
-                for ii in range(len(imgs)):
-                    base = data_val['imidx'][ii].item()
-                    print('base:', base)
-                    save_base = os.path.join(args.output, str(k)+'_'+ str(base))
-                    imgs_ii = imgs[ii].astype(dtype=np.uint8)
-                    show_iou = torch.tensor([iou.item()])
-                    show_boundary_iou = torch.tensor([boundary_iou.item()])
-                    show_anns(masks_vis[ii], None, labels_box[ii].cpu(), None, save_base , imgs_ii, show_iou, show_boundary_iou)
+
+                # Resize masks to original image resolution when available
+                target_h, target_w = labels_ori.shape[-2], labels_ori.shape[-1]
+                masks_vis_full = (F.interpolate(masks_for_eval.detach(), (target_h, target_w), mode="bilinear", align_corners=False) > 0)
+
+                if args.instance:
+                    # Accumulate masks per original image and write a single composite
+                    for ii in range(len(imgs)):
+                        ori_entry = data_val['ori_im_path']
+                        ori_path = ori_entry[ii] if isinstance(ori_entry, list) else ori_entry
+                        base_name = os.path.splitext(os.path.basename(ori_path))[0]
+                        save_path = os.path.join(args.output, str(k) + '_' + base_name + '_instances.png')
+
+                        if current_img_path is None:
+                            current_img_path = ori_path
+                            merged_save_path = save_path
+
+                        if ori_path != current_img_path:
+                            # Flush previous image composite
+                            if len(masks) > 0 and merged_save_path is not None:
+                                save_composite_instances(current_img_path, masks, merged_save_path)
+                            # Reset for new image
+                            current_img_path = ori_path
+                            merged_save_path = save_path
+                            masks = []
+
+                        masks.append(masks_vis_full[ii, 0])
+                else:
+                    # Default per-sample visualization on resized canvas (1024x1024)
+                    masks_vis = (F.interpolate(masks_for_eval.detach(), (1024, 1024), mode="bilinear", align_corners=False) > 0).cpu()
+                    for ii in range(len(imgs)):
+                        base = data_val['imidx'][ii].item()
+                        print('base:', base)
+                        save_base = os.path.join(args.output, str(k)+'_'+ str(base))
+                        imgs_ii = imgs[ii].astype(dtype=np.uint8)
+                        show_iou = torch.tensor([iou.item()])
+                        show_boundary_iou = torch.tensor([boundary_iou.item()])
+                        show_anns(masks_vis[ii], None, labels_box[ii].cpu(), None, save_base , imgs_ii, show_iou, show_boundary_iou)
                        
 
             loss_dict = {"val_iou_"+str(k): iou, "val_boundary_iou_"+str(k): boundary_iou}
             loss_dict_reduced = misc.reduce_dict(loss_dict)
             metric_logger.update(**loss_dict_reduced)
 
+
+        # Flush any pending merged composites for this dataloader
+        if visualize and args.instance:
+            if len(masks) > 0 and merged_save_path is not None and current_img_path is not None:
+                save_composite_instances(current_img_path, masks, merged_save_path)
 
         print('============================')
         # gather the stats from all processes
@@ -645,102 +710,43 @@ def evaluate(args, net, sam, valid_dataloaders, visualize=False):
 
 if __name__ == "__main__":
 
-    ### --------------- Configuring the Train and Valid datasets ---------------
-
-    dataset_dis = {"name": "DIS5K-TR",
-                 "im_dir": "./data/DIS5K/DIS-TR/im",
-                 "gt_dir": "./data/DIS5K/DIS-TR/gt",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
-
-    dataset_thin = {"name": "ThinObject5k-TR",
-                 "im_dir": "./data/thin_object_detection/ThinObject5K/images_train",
-                 "gt_dir": "./data/thin_object_detection/ThinObject5K/masks_train",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
-
-    dataset_fss = {"name": "FSS",
-                 "im_dir": "./data/cascade_psp/fss_all",
-                 "gt_dir": "./data/cascade_psp/fss_all",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
-
-    dataset_duts = {"name": "DUTS-TR",
-                 "im_dir": "./data/cascade_psp/DUTS-TR",
-                 "gt_dir": "./data/cascade_psp/DUTS-TR",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
-
-    dataset_duts_te = {"name": "DUTS-TE",
-                 "im_dir": "./data/cascade_psp/DUTS-TE",
-                 "gt_dir": "./data/cascade_psp/DUTS-TE",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
-
-    dataset_ecssd = {"name": "ECSSD",
-                 "im_dir": "./data/cascade_psp/ecssd",
-                 "gt_dir": "./data/cascade_psp/ecssd",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
-
-    dataset_msra = {"name": "MSRA10K",
-                 "im_dir": "./data/cascade_psp/MSRA_10K",
-                 "gt_dir": "./data/cascade_psp/MSRA_10K",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
-
-    # valid set
-    dataset_coift_val = {"name": "COIFT",
-                 "im_dir": "./data/thin_object_detection/COIFT/images",
-                 "gt_dir": "./data/thin_object_detection/COIFT/masks",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
-
-    dataset_hrsod_val = {"name": "HRSOD",
-                 "im_dir": "./data/thin_object_detection/HRSOD/images",
-                 "gt_dir": "./data/thin_object_detection/HRSOD/masks_max255",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
-
-    dataset_thin_val = {"name": "ThinObject5k-TE",
-                 "im_dir": "./data/thin_object_detection/ThinObject5K/images_test",
-                 "gt_dir": "./data/thin_object_detection/ThinObject5K/masks_test",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
-
-    dataset_dis_val = {"name": "DIS5K-VD",
-                 "im_dir": "./data/DIS5K/DIS-VD/im",
-                 "gt_dir": "./data/DIS5K/DIS-VD/gt",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
-
-    train_datasets = [dataset_dis, dataset_thin, dataset_fss, dataset_duts, dataset_duts_te, dataset_ecssd, dataset_msra]
-    valid_datasets = [dataset_dis_val, dataset_coift_val, dataset_hrsod_val, dataset_thin_val] 
-
     args = get_args_parser()
 
-    # Optional dataset overrides from CLI
-    if args.train_im_dir is not None and args.train_gt_dir is not None:
-        train_im_ext = args.train_im_ext if args.train_im_ext is not None else ".jpg"
-        train_gt_ext = args.train_gt_ext if args.train_gt_ext is not None else ".png"
-        train_datasets = [{
-            "name": "CUSTOM-TRAIN",
-            "im_dir": args.train_im_dir,
-            "gt_dir": args.train_gt_dir,
-            "im_ext": train_im_ext,
-            "gt_ext": train_gt_ext,
-        }]
+    src_root = "./data/fiber"
+    src_im_dir = os.path.join(src_root, "images")
+    src_gt_dir = os.path.join(src_root, "masks")
+    im_ext = ".jpg"
+    gt_ext = ".png"
+    dst_root = "./data/fiber_split"
 
-    if args.eval_im_dir is not None and args.eval_gt_dir is not None:
-        eval_im_ext = args.eval_im_ext if args.eval_im_ext is not None else ".jpg"
-        eval_gt_ext = args.eval_gt_ext if args.eval_gt_ext is not None else ".png"
-        valid_datasets = [{
-            "name": "CUSTOM-EVAL",
-            "im_dir": args.eval_im_dir,
-            "gt_dir": args.eval_gt_dir,
-            "im_ext": eval_im_ext,
-            "gt_ext": eval_gt_ext,
-        }]
+    src_inst_dir = os.path.join(src_root, "masks_inst")
+
+    train_im_dir, train_gt_dir, val_im_dir, val_gt_dir, train_inst_dir, val_inst_dir = misc.split_and_copy_dataset(
+        src_im_dir=src_im_dir,
+        src_gt_dir=src_gt_dir,
+        dst_root=dst_root,
+        im_ext=im_ext,
+        gt_ext=gt_ext,
+        split_ratio=0.8,
+        seed=args.seed,
+        src_inst_dir=src_inst_dir if os.path.isdir(src_inst_dir) else None,
+    )
+
+    # --------------- Register only your dataset via dataset dictionaries ---------------
+    dataset_fiber_train = {"name": "FIBER-TRAIN",
+                 "im_dir": train_im_dir,
+                 "gt_dir": (train_inst_dir if (hasattr(args, 'instance') and args.instance and train_inst_dir is not None) else train_gt_dir),
+                 "im_ext": im_ext,
+                 "gt_ext": gt_ext}
+
+    dataset_fiber_val = {"name": "FIBER-VAL",
+                 "im_dir": val_im_dir,
+                 "gt_dir": (val_inst_dir if (hasattr(args, 'instance') and args.instance and val_inst_dir is not None) else val_gt_dir),
+                 "im_ext": im_ext,
+                 "gt_ext": gt_ext}
+
+    train_datasets = [dataset_fiber_train]
+    valid_datasets = [dataset_fiber_val]
 
     net = MaskDecoderHQ(args.model_type) 
 

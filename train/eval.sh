@@ -6,5 +6,4 @@ torchrun --nproc_per_node=1 ./train.py \
   --output ./work_dirs/eval_hq_sam_l_100_instance_2 \
   --vis-branch hq \
   --visualize \
-  --instance \
-  --vis-merge-instances
+  --instance

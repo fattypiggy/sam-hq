@@ -11,7 +11,7 @@ import time
 from collections import OrderedDict, defaultdict, deque
 import datetime
 import pickle
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import json, time
 import numpy as np
@@ -535,3 +535,74 @@ def boundary_iou(gt, dt, dilation_ratio=0.02):
     union = ((gt_boundary + dt_boundary) > 0).sum()
     boundary_iou = intersection / union
     return torch.tensor(boundary_iou).float().to(device)
+
+def split_and_copy_dataset(src_im_dir: str,
+                               src_gt_dir: str,
+                               dst_root: str,
+                               im_ext: str,
+                               gt_ext: str,
+                               split_ratio: float = 0.8,
+                               seed: int = 42,
+                               src_inst_dir: Optional[str] = None) -> Tuple[str, str, str, str, Optional[str], Optional[str]]:
+        os.makedirs(dst_root, exist_ok=True)
+        dst_train_im = os.path.join(dst_root, 'train', 'images')
+        dst_train_gt = os.path.join(dst_root, 'train', 'masks')
+        dst_val_im = os.path.join(dst_root, 'val', 'images')
+        dst_val_gt = os.path.join(dst_root, 'val', 'masks')
+        dst_train_inst = os.path.join(dst_root, 'train', 'masks_inst') if src_inst_dir else None
+        dst_val_inst = os.path.join(dst_root, 'val', 'masks_inst') if src_inst_dir else None
+
+        for d in [dst_train_im, dst_train_gt, dst_val_im, dst_val_gt] + ([dst_train_inst, dst_val_inst] if src_inst_dir else []):
+            os.makedirs(d, exist_ok=True)
+
+        # Collect valid basenames that have both image and mask
+        image_files = [f for f in os.listdir(src_im_dir) if f.endswith(im_ext)]
+        basenames = []
+        for f in image_files:
+            base = os.path.splitext(f)[0]
+            mask_path = os.path.join(src_gt_dir, base + gt_ext)
+            if os.path.isfile(mask_path):
+                basenames.append(base)
+
+        rng = random.Random(seed)
+        rng.shuffle(basenames)
+        split_idx = int(len(basenames) * split_ratio)
+        train_bases = basenames[:split_idx]
+        val_bases = basenames[split_idx:]
+
+        def _copy_subset(bases: List[str], dst_im: str, dst_gt: str):
+            for b in bases:
+                src_im = os.path.join(src_im_dir, b + im_ext)
+                src_gt = os.path.join(src_gt_dir, b + gt_ext)
+                dst_im_path = os.path.join(dst_im, b + im_ext)
+                dst_gt_path = os.path.join(dst_gt, b + gt_ext)
+                if not os.path.isfile(dst_im_path):
+                    shutil.copy2(src_im, dst_im_path)
+                if not os.path.isfile(dst_gt_path):
+                    shutil.copy2(src_gt, dst_gt_path)
+
+        _copy_subset(train_bases, dst_train_im, dst_train_gt)
+        _copy_subset(val_bases, dst_val_im, dst_val_gt)
+
+        # Optionally copy instance masks matching basenames
+        if src_inst_dir:
+            def _copy_instances(bases: List[str], dst_inst_dir: str):
+                base_set = set(bases)
+                for f in os.listdir(src_inst_dir):
+                    if not f.endswith(gt_ext):
+                        continue
+                    # Expect pattern: <base>_<id><gt_ext>
+                    name, _ = os.path.splitext(f)
+                    if '_' not in name:
+                        continue
+                    base = name.rsplit('_', 1)[0]
+                    if base in base_set:
+                        src_f = os.path.join(src_inst_dir, f)
+                        dst_f = os.path.join(dst_inst_dir, f)
+                        if not os.path.isfile(dst_f):
+                            shutil.copy2(src_f, dst_f)
+
+            _copy_instances(train_bases, dst_train_inst)
+            _copy_instances(val_bases, dst_val_inst)
+
+        return dst_train_im, dst_train_gt, dst_val_im, dst_val_gt, dst_train_inst, dst_val_inst
