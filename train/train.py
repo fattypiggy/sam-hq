@@ -17,6 +17,10 @@ import cv2
 import random
 import shutil
 from typing import Dict, List, Tuple, Optional
+import json
+import logging
+
+from torch.utils.tensorboard import SummaryWriter
 
 from segment_anything_training import sam_model_registry
 from segment_anything_training.modeling import TwoWayTransformer, MaskDecoder
@@ -377,6 +381,25 @@ def main(net, train_datasets, valid_datasets, args):
     np.random.seed(seed)
     random.seed(seed)
 
+    # Setup logging and TensorBoard writer (main process only)
+    writer: Optional[SummaryWriter] = None
+    metrics_jsonl_path = None
+    if misc.is_main_process():
+        os.makedirs(args.output, exist_ok=True)
+        # Python logging to file
+        logger = logging.getLogger("train")
+        logger.setLevel(logging.INFO)
+        fh = logging.FileHandler(os.path.join(args.output, "train.log"))
+        fh.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        fh.setFormatter(formatter)
+        # Avoid duplicate handlers across multiple calls
+        if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+            logger.addHandler(fh)
+        logging.getLogger().setLevel(logging.INFO)
+        writer = SummaryWriter(log_dir=os.path.join(args.output, "tb"))
+        metrics_jsonl_path = os.path.join(args.output, "metrics.jsonl")
+
     ### --- Step 1: Train or Valid dataset ---
     if not args.eval:
         print("--- create training dataloader ---")
@@ -414,7 +437,7 @@ def main(net, train_datasets, valid_datasets, args):
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop_epoch)
         lr_scheduler.last_epoch = args.start_epoch
 
-        train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_scheduler)
+        train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_scheduler, writer, metrics_jsonl_path)
     else:
         sam = sam_model_registry[args.model_type](checkpoint=args.checkpoint)
         _ = sam.to(device=args.device)
@@ -427,10 +450,10 @@ def main(net, train_datasets, valid_datasets, args):
             else:
                 net_without_ddp.load_state_dict(torch.load(args.restore_model,map_location="cpu"))
     
-        evaluate(args, net, sam, valid_dataloaders, args.visualize)
+        evaluate(args, net, sam, valid_dataloaders, args.visualize, writer)
 
 
-def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_scheduler):
+def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_scheduler, writer: Optional[SummaryWriter], metrics_jsonl_path: Optional[str]):
     if misc.is_main_process():
         os.makedirs(args.output, exist_ok=True)
 
@@ -445,11 +468,13 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
     _ = sam.to(device=args.device)
     sam = torch.nn.parallel.DistributedDataParallel(sam, device_ids=[args.gpu], find_unused_parameters=args.find_unused_params)
     
+    steps_per_epoch = len(train_dataloaders)
     for epoch in range(epoch_start,epoch_num): 
         print("epoch:   ",epoch, "  learning rate:  ", optimizer.param_groups[0]["lr"])
         metric_logger = misc.MetricLogger(delimiter="  ")
         train_dataloaders.batch_sampler.sampler.set_epoch(epoch)
 
+        local_step = 0
         for data in metric_logger.log_every(train_dataloaders,1000):
             inputs, labels = data['image'], data['label']
             if torch.cuda.is_available():
@@ -523,6 +548,29 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
 
             metric_logger.update(training_loss=loss_value, **loss_dict_reduced)
 
+            if misc.is_main_process():
+                global_step = epoch * steps_per_epoch + local_step
+                if writer is not None:
+                    writer.add_scalar('train/loss', loss_value, global_step)
+                    writer.add_scalar('train/loss_mask', float(loss_mask.detach().item()), global_step)
+                    writer.add_scalar('train/loss_dice', float(loss_dice.detach().item()), global_step)
+                    writer.add_scalar('train/lr', float(optimizer.param_groups[0]["lr"]), global_step)
+                if metrics_jsonl_path is not None:
+                    try:
+                        with open(metrics_jsonl_path, 'a', encoding='utf-8') as jf:
+                            jf.write(json.dumps({
+                                "type": "train_step",
+                                "epoch": int(epoch),
+                                "step": int(global_step),
+                                "loss": float(loss_value),
+                                "loss_mask": float(loss_mask.detach().item()),
+                                "loss_dice": float(loss_dice.detach().item()),
+                                "lr": float(optimizer.param_groups[0]["lr"]),
+                            }) + "\n")
+                    except Exception:
+                        pass
+            local_step += 1
+
 
         print("Finished epoch:      ", epoch)
         metric_logger.synchronize_between_processes()
@@ -530,8 +578,16 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
         train_stats = {k: meter.global_avg for k, meter in metric_logger.meters.items() if meter.count > 0}
 
         lr_scheduler.step()
-        test_stats = evaluate(args, net, sam, valid_dataloaders)
+        test_stats = evaluate(args, net, sam, valid_dataloaders, visualize=False, writer=writer, epoch=epoch)
         train_stats.update(test_stats)
+        if misc.is_main_process() and metrics_jsonl_path is not None:
+            try:
+                with open(metrics_jsonl_path, 'a', encoding='utf-8') as jf:
+                    payload = {"type": "valid_epoch", "epoch": int(epoch)}
+                    payload.update({k: (float(v) if hasattr(v, 'item') else float(v)) for k, v in test_stats.items()})
+                    jf.write(json.dumps(payload) + "\n")
+            except Exception:
+                pass
         
         net.train()  
 
@@ -541,6 +597,9 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
             misc.save_on_master(net.module.state_dict(), args.output + model_name)
     
     # Finish training
+    if misc.is_main_process() and writer is not None:
+        writer.flush()
+        writer.close()
     print("Training Reaches The Maximum Epoch Number")
     
     # merge sam and hq_decoder
@@ -578,7 +637,7 @@ def compute_boundary_iou(preds, target):
         iou = iou + misc.boundary_iou(target[i],postprocess_preds[i])
     return iou / len(preds)
 
-def evaluate(args, net, sam, valid_dataloaders, visualize=False):
+def evaluate(args, net, sam, valid_dataloaders, visualize=False, writer: Optional[SummaryWriter] = None, epoch: Optional[int] = None):
     net.eval()
     print("Validating...")
     test_stats = {}
@@ -644,6 +703,15 @@ def evaluate(args, net, sam, valid_dataloaders, visualize=False):
             iou = compute_iou(masks_for_eval,labels_ori)
             boundary_iou = compute_boundary_iou(masks_for_eval,labels_ori)
 
+            # Compute a validation loss consistent with training
+            # Resize labels to match masks_for_eval spatially
+            if masks_for_eval.shape[-2:] != labels_val.shape[-2:]:
+                labels_resized = F.interpolate(labels_val, size=masks_for_eval.shape[-2:], mode='bilinear', align_corners=False)
+            else:
+                labels_resized = labels_val
+            val_loss_mask, val_loss_dice = loss_masks(masks_for_eval, labels_resized/255.0, len(masks_for_eval))
+            val_loss = val_loss_mask + val_loss_dice
+
             if visualize:
                 print("visualize")
                 os.makedirs(args.output, exist_ok=True)
@@ -687,7 +755,7 @@ def evaluate(args, net, sam, valid_dataloaders, visualize=False):
                         show_anns(masks_vis[ii], None, labels_box[ii].cpu(), None, save_base , imgs_ii, show_iou, show_boundary_iou)
                        
 
-            loss_dict = {"val_iou_"+str(k): iou, "val_boundary_iou_"+str(k): boundary_iou}
+            loss_dict = {"val_iou_"+str(k): iou, "val_boundary_iou_"+str(k): boundary_iou, "val_loss_"+str(k): val_loss}
             loss_dict_reduced = misc.reduce_dict(loss_dict)
             metric_logger.update(**loss_dict_reduced)
 
@@ -702,6 +770,11 @@ def evaluate(args, net, sam, valid_dataloaders, visualize=False):
         metric_logger.synchronize_between_processes()
         print("Averaged stats:", metric_logger)
         resstat = {k: meter.global_avg for k, meter in metric_logger.meters.items() if meter.count > 0}
+        # Log validation aggregates to TensorBoard
+        if misc.is_main_process() and writer is not None and epoch is not None:
+            for key, value in resstat.items():
+                if key.startswith("val_"):
+                    writer.add_scalar(f"valid/{key}", float(value), epoch)
         test_stats.update(resstat)
 
 

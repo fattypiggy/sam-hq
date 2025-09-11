@@ -23,6 +23,7 @@ import colorsys
 import torch.nn.functional as F
 
 import cv2
+import shutil
 
 # needed due to empty tensor bug in pytorch and torchvision 0.5
 import torchvision
@@ -555,13 +556,13 @@ def split_and_copy_dataset(src_im_dir: str,
         for d in [dst_train_im, dst_train_gt, dst_val_im, dst_val_gt] + ([dst_train_inst, dst_val_inst] if src_inst_dir else []):
             os.makedirs(d, exist_ok=True)
 
-        # Collect valid basenames that have both image and mask
-        image_files = [f for f in os.listdir(src_im_dir) if f.endswith(im_ext)]
+        # Collect valid basenames based on masks (src_gt_dir) to avoid unlabeled images
+        mask_files = [f for f in os.listdir(src_gt_dir) if f.endswith(gt_ext)]
         basenames = []
-        for f in image_files:
+        for f in mask_files:
             base = os.path.splitext(f)[0]
-            mask_path = os.path.join(src_gt_dir, base + gt_ext)
-            if os.path.isfile(mask_path):
+            img_path = os.path.join(src_im_dir, base + im_ext)
+            if os.path.isfile(img_path):
                 basenames.append(base)
 
         rng = random.Random(seed)
