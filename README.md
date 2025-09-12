@@ -135,12 +135,11 @@ pip install opencv-python pycocotools matplotlib onnxruntime onnx timm
 conda create --name sam_hq python=3.8 -y
 conda activate sam_hq
 conda install pytorch==1.10.0 torchvision==0.11.0 cudatoolkit=11.1 -c pytorch -c nvidia
-pip install opencv-python pycocotools matplotlib onnxruntime onnx timm
+pip install opencv-python pycocotools matplotlib onnxruntime onnx timm tensorboard scikit-image
 
 # under your working directory
 git clone https://github.com/SysCV/sam-hq.git
 cd sam-hq
-pip install -e .
 export PYTHONPATH=$(pwd)
 ```
 
