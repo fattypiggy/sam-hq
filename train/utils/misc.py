@@ -481,7 +481,7 @@ def masks_noise(masks):
     return gt_masks_vector
 
 
-def mask_iou(pred_label,label):
+def mask_iou(pred_label,label, eps=1e-6):
     '''
     calculate mask iou for pred_label and gt_label
     '''
@@ -491,7 +491,7 @@ def mask_iou(pred_label,label):
 
     intersection = ((label * pred_label) > 0).sum()
     union = ((label + pred_label) > 0).sum()
-    return intersection / union
+    return intersection / (union + eps)
 
 
 
@@ -518,7 +518,7 @@ def mask_to_boundary(mask, dilation_ratio=0.02):
     return mask - mask_erode
 
 
-def boundary_iou(gt, dt, dilation_ratio=0.02):
+def boundary_iou(gt, dt, dilation_ratio=0.02, eps=1e-6):
     """
     Compute boundary iou between two binary masks.
     :param gt (numpy array, uint8): binary mask
@@ -534,7 +534,7 @@ def boundary_iou(gt, dt, dilation_ratio=0.02):
     dt_boundary = mask_to_boundary(dt, dilation_ratio)
     intersection = ((gt_boundary * dt_boundary) > 0).sum()
     union = ((gt_boundary + dt_boundary) > 0).sum()
-    boundary_iou = intersection / union
+    boundary_iou = intersection / (union + eps)
     return torch.tensor(boundary_iou).float().to(device)
 
 def split_and_copy_dataset(src_im_dir: str,
