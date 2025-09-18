@@ -715,19 +715,33 @@ def evaluate(args, net, sam, valid_dataloaders, visualize=False, writer: Optiona
             if visualize:
                 print("visualize")
                 os.makedirs(args.output, exist_ok=True)
+                masks_dir = os.path.join(args.output, "masks")
+                masks_inst_dir = os.path.join(args.output, "masks_inst")
+                os.makedirs(masks_dir, exist_ok=True)
+                if args.instance:
+                    os.makedirs(masks_inst_dir, exist_ok=True)
 
                 # Resize masks to original image resolution when available
                 target_h, target_w = labels_ori.shape[-2], labels_ori.shape[-1]
                 masks_vis_full = (F.interpolate(masks_for_eval.detach(), (target_h, target_w), mode="bilinear", align_corners=False) > 0)
 
                 if args.instance:
-                    # Accumulate masks per original image and write a single composite
+                    # Accumulate masks per original image and also save each instance overlay
                     for ii in range(len(imgs)):
                         ori_entry = data_val['ori_im_path']
                         ori_path = ori_entry[ii] if isinstance(ori_entry, list) else ori_entry
                         base_name = os.path.splitext(os.path.basename(ori_path))[0]
-                        save_path = os.path.join(args.output, str(k) + '_' + base_name + '_instances.png')
 
+                        # Save per-instance visualization
+                        inst_entry = data_val['ori_gt_path']
+                        inst_path = inst_entry[ii] if isinstance(inst_entry, list) else inst_entry
+                        inst_stem = os.path.splitext(os.path.basename(inst_path))[0]
+                        inst_id = inst_stem.rsplit('_', 1)[1] if '_' in inst_stem else 'inst'
+                        inst_save_path = os.path.join(masks_inst_dir, str(k) + '_' + base_name + '_' + inst_id + '.png')
+                        save_composite_instances(ori_path, [masks_vis_full[ii, 0]], inst_save_path)
+
+                        # Manage per-image merged composite path under masks/
+                        save_path = os.path.join(masks_dir, str(k) + '_' + base_name + '.png')
                         if current_img_path is None:
                             current_img_path = ori_path
                             merged_save_path = save_path
@@ -743,16 +757,13 @@ def evaluate(args, net, sam, valid_dataloaders, visualize=False, writer: Optiona
 
                         masks.append(masks_vis_full[ii, 0])
                 else:
-                    # Default per-sample visualization on resized canvas (1024x1024)
-                    masks_vis = (F.interpolate(masks_for_eval.detach(), (1024, 1024), mode="bilinear", align_corners=False) > 0).cpu()
+                    # Per-image visualization at original resolution into masks/
                     for ii in range(len(imgs)):
-                        base = data_val['imidx'][ii].item()
-                        print('base:', base)
-                        save_base = os.path.join(args.output, str(k)+'_'+ str(base))
-                        imgs_ii = imgs[ii].astype(dtype=np.uint8)
-                        show_iou = torch.tensor([iou.item()])
-                        show_boundary_iou = torch.tensor([boundary_iou.item()])
-                        show_anns(masks_vis[ii], None, labels_box[ii].cpu(), None, save_base , imgs_ii, show_iou, show_boundary_iou)
+                        ori_entry = data_val['ori_im_path']
+                        ori_path = ori_entry[ii] if isinstance(ori_entry, list) else ori_entry
+                        base_name = os.path.splitext(os.path.basename(ori_path))[0]
+                        save_path = os.path.join(masks_dir, str(k) + '_' + base_name + '.png')
+                        save_composite_instances(ori_path, [masks_vis_full[ii, 0]], save_path)
                        
 
             loss_dict = {"val_iou_"+str(k): iou, "val_boundary_iou_"+str(k): boundary_iou, "val_loss_"+str(k): val_loss}
