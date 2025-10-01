@@ -1,6 +1,6 @@
 python tools/measure_binary_instance_widths.py \
---input-dir binary_masks \
---output-dir measurement_results \
+--input-dir test/test_results_64_iou0.6_stable0.925_vit_l_island3000_hole100_area2000-Oct1-8/binary_mask_instance \
+--output-dir measurement_results-Oct-1-3 \
 --csv-name widths.csv \
 --binary-thresh 127 \
 --sample-stride 2 \
@@ -11,4 +11,7 @@ python tools/measure_binary_instance_widths.py \
 --skeleton-radius 1 \
 --prune \
 --prune-min-length 10.0 \
---max-width-thresh 100.0
+--max-width-thresh 100.0 \
+--iqr-multiplier 1.5 \
+--gradient-threshold 2.0 \
+--max-skeleton-jump 2.0
