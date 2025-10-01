@@ -270,6 +270,9 @@ def remove_small_regions(
     """
     Removes small disconnected regions and holes in a mask. Returns the
     mask and an indicator of if the mask has been modified.
+
+    For mode="islands": Only keeps the largest island, removes all others.
+    For mode="holes": Removes holes smaller than area_thresh.
     """
     import cv2  # type: ignore
 
@@ -278,17 +281,26 @@ def remove_small_regions(
     working_mask = (correct_holes ^ mask).astype(np.uint8)
     n_labels, regions, stats, _ = cv2.connectedComponentsWithStats(working_mask, 8)
     sizes = stats[:, -1][1:]  # Row 0 is background label
-    small_regions = [i + 1 for i, s in enumerate(sizes) if s < area_thresh]
-    if len(small_regions) == 0:
-        return mask, False
-    fill_labels = [0] + small_regions
-    if not correct_holes:
-        fill_labels = [i for i in range(n_labels) if i not in fill_labels]
+
+    if not correct_holes:  # mode == "islands"
+        # Remove islands smaller than area_thresh
+        small_regions = [i + 1 for i, s in enumerate(sizes) if s < area_thresh]
+        if len(small_regions) == 0:
+            return mask, False
+        fill_labels = [i for i in range(n_labels) if i not in ([0] + small_regions)]
         # If every region is below threshold, keep largest
         if len(fill_labels) == 0:
             fill_labels = [int(np.argmax(sizes)) + 1]
-    mask = np.isin(regions, fill_labels)
-    return mask, True
+        mask = np.isin(regions, fill_labels)
+        return mask, True
+    else:  # mode == "holes"
+        # Remove holes smaller than area_thresh
+        small_regions = [i + 1 for i, s in enumerate(sizes) if s < area_thresh]
+        if len(small_regions) == 0:
+            return mask, False
+        fill_labels = [0] + small_regions
+        mask = np.isin(regions, fill_labels)
+        return mask, True
 
 
 def coco_encode_rle(uncompressed_rle: Dict[str, Any]) -> Dict[str, Any]:

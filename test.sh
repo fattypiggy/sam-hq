@@ -1,12 +1,15 @@
 python demo/demo_hqsam_auto_instances.py \
 --checkpoint train/pretrained_checkpoint/sam_vit_l_0b3195.pth \
---restore-model train/work_dirs/train_hq_sam_l_100_instance-200images-3/epoch_45.pth \
+--restore-model train/pretrained_checkpoint/epoch_45.pth \
 --model-type vit_l \
---input images \
---output test/test_results_64_iou0.6_stable0.925_minmask1000_minarea2000_vit_l \
+--input images2 \
+--output test/test_results_64_iou0.6_stable0.925_vit_l_island3000_hole100_area2000-Oct1-7 \
 --device cuda \
 --points-per-side 64 \
 --pred-iou-thresh 0.6 \
 --stability-score-thresh 0.925 \
---min-mask-region-area 100 \
---min-instance-area 2000
+--min-hole-region-area 100 \
+--min-island-region-area 3000 \
+--min-instance-area 2000 \
+--overlap-thresh 0.2 \
+--resume-index 0

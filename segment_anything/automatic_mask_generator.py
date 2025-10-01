@@ -49,6 +49,9 @@ class SamAutomaticMaskGenerator:
         point_grids: Optional[List[np.ndarray]] = None,
         min_mask_region_area: int = 0,
         output_mode: str = "binary_mask",
+        # Optional separate thresholds. If None, fall back to min_mask_region_area.
+        min_hole_region_area: Optional[int] = None,
+        min_island_region_area: Optional[int] = None,
     ) -> None:
         """
         Using a SAM model, generates masks for the entire image.
@@ -117,7 +120,11 @@ class SamAutomaticMaskGenerator:
         if output_mode == "coco_rle":
             from pycocotools import mask as mask_utils  # type: ignore # noqa: F401
 
-        if min_mask_region_area > 0:
+        if (
+            (min_mask_region_area is not None and min_mask_region_area > 0)
+            or (min_hole_region_area is not None and min_hole_region_area > 0)
+            or (min_island_region_area is not None and min_island_region_area > 0)
+        ):
             import cv2  # type: ignore # noqa: F401
 
         self.predictor = SamPredictor(model)
@@ -131,6 +138,8 @@ class SamAutomaticMaskGenerator:
         self.crop_overlap_ratio = crop_overlap_ratio
         self.crop_n_points_downscale_factor = crop_n_points_downscale_factor
         self.min_mask_region_area = min_mask_region_area
+        self.min_hole_region_area = min_hole_region_area
+        self.min_island_region_area = min_island_region_area
         self.output_mode = output_mode
 
     @torch.no_grad()
@@ -162,12 +171,25 @@ class SamAutomaticMaskGenerator:
         # Generate masks
         mask_data = self._generate_masks(image, multimask_output)
 
-        # Filter small disconnected regions and holes in masks
-        if self.min_mask_region_area > 0:
+        # Filter small disconnected regions and holes in masks.
+        # Allow separate thresholds for holes and islands when provided.
+        area_holes = (
+            self.min_hole_region_area
+            if self.min_hole_region_area is not None
+            else self.min_mask_region_area
+        )
+        area_islands = (
+            self.min_island_region_area
+            if self.min_island_region_area is not None
+            else self.min_mask_region_area
+        )
+        if max(area_holes or 0, area_islands or 0) > 0:
             mask_data = self.postprocess_small_regions(
                 mask_data,
                 self.min_mask_region_area,
                 max(self.box_nms_thresh, self.crop_nms_thresh),
+                min_area_islands=area_islands,
+                min_area_holes=area_holes,
             )
 
         # Encode masks
@@ -324,7 +346,11 @@ class SamAutomaticMaskGenerator:
 
     @staticmethod
     def postprocess_small_regions(
-        mask_data: MaskData, min_area: int, nms_thresh: float
+        mask_data: MaskData,
+        min_area: int,
+        nms_thresh: float,
+        min_area_islands: Optional[int] = None,
+        min_area_holes: Optional[int] = None,
     ) -> MaskData:
         """
         Removes small disconnected regions and holes in masks, then reruns
@@ -340,18 +366,20 @@ class SamAutomaticMaskGenerator:
         # Filter small disconnected regions and holes
         new_masks = []
         scores = []
+        changed_flags = []
+        area_holes = min_area_holes if min_area_holes is not None else min_area
+        area_islands = min_area_islands if min_area_islands is not None else min_area
         for rle in mask_data["rles"]:
             mask = rle_to_mask(rle)
 
-            mask, changed = remove_small_regions(mask, min_area, mode="holes")
-            unchanged = not changed
-            mask, changed = remove_small_regions(mask, min_area, mode="islands")
-            unchanged = unchanged and not changed
+            mask, changed_holes = remove_small_regions(mask, area_holes, mode="holes")
+            mask, changed_islands = remove_small_regions(mask, area_islands, mode="islands")
+            changed = changed_holes or changed_islands
 
             new_masks.append(torch.as_tensor(mask).unsqueeze(0))
-            # Give score=0 to changed masks and score=1 to unchanged masks
-            # so NMS will prefer ones that didn't need postprocessing
-            scores.append(float(unchanged))
+            # Give score based on mask area so NMS will prefer larger masks
+            scores.append(float(torch.sum(torch.as_tensor(mask))))
+            changed_flags.append(changed)
 
         # Recalculate boxes and remove any new duplicates
         masks = torch.cat(new_masks, dim=0)
@@ -365,7 +393,7 @@ class SamAutomaticMaskGenerator:
 
         # Only recalculate RLEs for masks that have changed
         for i_mask in keep_by_nms:
-            if scores[i_mask] == 0.0:
+            if changed_flags[i_mask]:
                 mask_torch = masks[i_mask].unsqueeze(0)
                 mask_data["rles"][i_mask] = mask_to_rle_pytorch(mask_torch)[0]
                 mask_data["boxes"][i_mask] = boxes[i_mask]  # update res directly

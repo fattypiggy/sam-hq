@@ -1,0 +1,14 @@
+python tools/measure_binary_instance_widths.py \
+--input-dir binary_masks \
+--output-dir measurement_results \
+--csv-name widths.csv \
+--binary-thresh 127 \
+--sample-stride 2 \
+--pca-radius 21 \
+--cast-step 0.5 \
+--max-cast-steps 4096 \
+--save-skeleton \
+--skeleton-radius 1 \
+--prune \
+--prune-min-length 10.0 \
+--max-width-thresh 100.0
