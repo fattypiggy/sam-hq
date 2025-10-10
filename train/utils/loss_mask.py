@@ -2,6 +2,7 @@ import torch
 from torch.nn import functional as F
 from typing import List, Optional
 import utils.misc as misc
+from utils.skeleton_utils import batch_compute_tubed_skeleton
 
 def point_sample(input, point_coords, **kwargs):
     """
@@ -156,6 +157,65 @@ def calculate_uncertainty(logits):
     gt_class_logits = logits.clone()
     return -(torch.abs(gt_class_logits))
 
+def skeleton_recall_loss(
+        src_masks: torch.Tensor,
+        target_skeletons: torch.Tensor,
+        num_masks: float,
+        smooth: float = 1.0,
+    ):
+    """
+    Compute Skeleton Recall Loss for connectivity preservation.
+
+    Based on "Skeleton Recall Loss for Connectivity Conserving and Resource Efficient
+    Segmentation of Thin Tubular Structures" (https://arxiv.org/abs/2404.03010)
+
+    This loss computes soft recall of predictions on the tubed skeleton:
+    L_SkelRecall = -1/|C| * Σ_c (Σ_i Y_skel_{i,c} * Ŷ_{i,c}) / (Σ_i Y_skel_{i,c})
+
+    The loss encourages the network to include as much of the skeleton as possible
+    in the prediction, thus preserving connectivity.
+
+    Args:
+        src_masks: Predicted masks (logits), shape (B, 1, H, W)
+        target_skeletons: Tubed skeleton ground truth, shape (B, 1, H, W)
+                         Values: 0 (background) or positive (skeleton regions)
+        num_masks: Number of masks for normalization
+        smooth: Smoothing factor to avoid division by zero (default: 1.0)
+
+    Returns:
+        Skeleton recall loss (scalar tensor)
+    """
+    # Apply sigmoid to get probabilities
+    src_probs = src_masks.sigmoid()
+
+    # Flatten spatial dimensions: (B, 1, H, W) -> (B, H*W)
+    src_probs_flat = src_probs.flatten(1)
+    target_skel_flat = target_skeletons.flatten(1)
+
+    # Binarize skeleton (anything > 0 is skeleton)
+    target_skel_binary = (target_skel_flat > 0).float()
+
+    # Compute intersection: prediction overlap with skeleton
+    intersection = (src_probs_flat * target_skel_binary).sum(-1)  # (B,)
+
+    # Sum of skeleton pixels (denominator for recall)
+    skeleton_sum = target_skel_binary.sum(-1)  # (B,)
+
+    # Recall = intersection / skeleton_sum
+    # Add smoothing to avoid division by zero
+    recall = (intersection + smooth) / (skeleton_sum + smooth)
+
+    # Return negative recall as loss (we want to maximize recall, minimize loss)
+    loss = 1.0 - recall
+
+    return loss.sum() / num_masks
+
+
+skeleton_recall_loss_jit = torch.jit.script(
+    skeleton_recall_loss
+)  # type: torch.jit.ScriptModule
+
+
 def loss_masks(src_masks, target_masks, num_masks, oversample_ratio=3.0):
     """Compute the losses related to the masks: the focal loss and the dice loss.
     targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
@@ -191,6 +251,51 @@ def loss_masks(src_masks, target_masks, num_masks, oversample_ratio=3.0):
     del src_masks
     del target_masks
     return loss_mask, loss_dice
+
+
+def loss_masks_with_skeleton(
+        src_masks: torch.Tensor,
+        target_masks: torch.Tensor,
+        target_skeletons: Optional[torch.Tensor],
+        num_masks: float,
+        oversample_ratio: float = 3.0,
+        weight_skeleton: float = 1.0
+    ):
+    """
+    Compute combined loss: focal + dice + skeleton recall.
+
+    Args:
+        src_masks: Predicted masks (logits), shape (B, 1, H, W)
+        target_masks: Target masks, shape (B, 1, H, W)
+        target_skeletons: Tubed skeletons, shape (B, 1, H, W). If None, no skeleton loss.
+        num_masks: Number of masks for normalization
+        oversample_ratio: Oversampling ratio for point sampling
+        weight_skeleton: Weight for skeleton recall loss (default: 1.0)
+
+    Returns:
+        Tuple of (loss_mask, loss_dice, loss_skeleton) or (loss_mask, loss_dice, 0) if no skeleton
+    """
+    # Compute standard losses
+    loss_mask, loss_dice = loss_masks(src_masks, target_masks, num_masks, oversample_ratio)
+
+    # Compute skeleton loss if skeleton is provided
+    if target_skeletons is not None and weight_skeleton > 0:
+        # Resize skeleton to match src_masks spatial dimensions if needed
+        if target_skeletons.shape[-2:] != src_masks.shape[-2:]:
+            target_skeletons_resized = F.interpolate(
+                target_skeletons,
+                size=src_masks.shape[-2:],
+                mode='bilinear',
+                align_corners=False
+            )
+        else:
+            target_skeletons_resized = target_skeletons
+
+        loss_skeleton = skeleton_recall_loss_jit(src_masks, target_skeletons_resized, num_masks) * weight_skeleton
+    else:
+        loss_skeleton = torch.tensor(0.0, device=src_masks.device)
+
+    return loss_mask, loss_dice, loss_skeleton
 
 
 

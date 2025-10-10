@@ -179,6 +179,39 @@ class Normalize(object):
 
 
 
+class AddSkeletonTransform(object):
+    """
+    Add tubed skeleton to sample for Skeleton Recall Loss.
+    Based on "Skeleton Recall Loss for Connectivity Conserving and Resource Efficient
+    Segmentation of Thin Tubular Structures" (https://arxiv.org/abs/2404.03010)
+    """
+    def __init__(self, do_tube=True, tube_radius=2):
+        self.do_tube = do_tube
+        self.tube_radius = tube_radius
+
+    def __call__(self, sample):
+        from utils.skeleton_utils import compute_tubed_skeleton
+
+        imidx, image, label, shape = sample['imidx'], sample['image'], sample['label'], sample['shape']
+
+        # Compute tubed skeleton from label
+        # label is (1, H, W), convert to numpy for skeleton computation
+        label_np = label[0].cpu().numpy()
+        skeleton = compute_tubed_skeleton(
+            label_np,
+            do_tube=self.do_tube,
+            tube_radius=self.tube_radius
+        )
+
+        # Convert back to tensor with same shape as label (1, H, W)
+        skeleton_tensor = torch.from_numpy(skeleton).unsqueeze(0).float()
+
+        # Add skeleton to sample
+        sample['skeleton'] = skeleton_tensor
+
+        return sample
+
+
 class LargeScaleJitter(object):
     """
         implementation of large scale jitter from copy_paste
