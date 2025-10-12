@@ -1,9 +1,9 @@
 python demo/demo_hqsam_auto_instances.py \
 --checkpoint train/pretrained_checkpoint/sam_vit_l_0b3195.pth \
---restore-model train/pretrained_checkpoint/epoch_45.pth \
+--restore-model train/ckpts/vit_l_loss.pth \
 --model-type vit_l \
---input images2 \
---output test/test_results_64_iou0.6_stable0.925_vit_l_island3000_hole100_area2000-Oct1-7 \
+--input ~/Datasets/fiber/A01-029 1-1/ \
+--output ~/Datasets/fiber/A01-029 1-1/ \
 --device cuda \
 --points-per-side 64 \
 --pred-iou-thresh 0.6 \
@@ -11,5 +11,6 @@ python demo/demo_hqsam_auto_instances.py \
 --min-hole-region-area 100 \
 --min-island-region-area 3000 \
 --min-instance-area 2000 \
+--max-instance-area-ratio 0.1 \
 --overlap-thresh 0.2 \
 --resume-index 0
