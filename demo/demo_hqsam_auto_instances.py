@@ -141,6 +141,7 @@ def main():
     parser.add_argument("--min-island-region-area", type=int, default=None, help="Post-process island regions below this area; overrides min-mask-region-area for islands")
     parser.add_argument("--multimask-output", action="store_true", help="Enable multi-mask output per point")
     parser.add_argument("--min-instance-area", type=int, default=0, help="Filter out instances with pixel area < value after generation")
+    parser.add_argument("--max-instance-area-ratio", type=float, default=0.1, help="Filter out instances with area ratio > value (default: 0.1 = 10% of image)")
     parser.add_argument("--overlap-thresh", type=float, default=0.5, help="Overlap threshold for removing overlapping masks (0.0-1.0)")
     parser.add_argument("--resume-index", type=int, default=1, help="1-based index of image to start processing (skip previous images)")
 
@@ -205,9 +206,31 @@ def main():
         image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
         anns = mask_generator.generate(image, multimask_output=args.multimask_output)
+
+        # Calculate image total area for ratio-based filtering
+        image_total_area = image.shape[0] * image.shape[1]
+        max_instance_area = int(image_total_area * args.max_instance_area_ratio)
+
         # Optional post-filter by instance area (pixel count)
+        original_count = len(anns)
         if args.min_instance_area > 0:
             anns = [ann for ann in anns if int(ann.get("area", 0)) >= int(args.min_instance_area)]
+
+        # Filter out masks that are too large (likely noise or background)
+        if args.max_instance_area_ratio > 0:
+            filtered_anns = []
+            for ann in anns:
+                area = int(ann.get("area", 0))
+                if area <= max_instance_area:
+                    filtered_anns.append(ann)
+                else:
+                    area_ratio = area / image_total_area
+                    print(f"  Filtering out oversized mask: area={area}, ratio={area_ratio:.2%} (>{args.max_instance_area_ratio:.1%})")
+            anns = filtered_anns
+
+        if len(anns) < original_count:
+            print(f"  Area filtering: {original_count} → {len(anns)} masks")
+
         masks = [ann["segmentation"].astype(bool) for ann in anns]
         
         # Remove overlapping masks
