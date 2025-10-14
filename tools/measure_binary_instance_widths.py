@@ -7,6 +7,10 @@ import argparse
 import numpy as np
 from typing import List, Tuple, Optional
 
+# Fix OpenCV segmentation fault by disabling multithreading
+# Reference: https://github.com/opencv/opencv/issues/20311
+cv2.setNumThreads(1)
+
 
 def read_binary_mask(image_path: str, binary_threshold: int = 127) -> np.ndarray:
     """
@@ -174,17 +178,25 @@ def estimate_tangent_from_neighbors(
 
 def cast_to_boundary(
     mask: np.ndarray, start_yx: Tuple[float, float], direction_yx: np.ndarray,
-    max_steps: int = 4096, step: float = 0.5
+    max_steps: int = 4096, step: float = 0.5, skeleton_dist: Optional[np.ndarray] = None,
+    max_skeleton_jump: float = 3.0
 ) -> Tuple[float, Tuple[int, int]]:
     """
     Cast a ray from start along direction until leaving the mask.
     Returns (distance, endpoint_int_yx). Distance is in pixels (Euclidean, step-based).
+
+    Args:
+        skeleton_dist: Optional distance transform of skeleton. If provided, will stop
+                      when moving too far from skeleton (detecting branch crossings).
+        max_skeleton_jump: Maximum allowed jump in skeleton distance (stops at branches).
     """
     height, width = mask.shape[:2]
     dy, dx = float(direction_yx[0]), float(direction_yx[1])
     yy, xx = float(start_yx[0]), float(start_yx[1])
 
     traveled = 0.0
+    prev_skel_dist = 0.0 if skeleton_dist is not None else None
+
     for _ in range(int(max_steps)):
         yy = float(yy) + float(dy * step)
         xx = float(xx) + float(dx * step)
@@ -193,6 +205,17 @@ def cast_to_boundary(
             break
         if mask[iy, ix] == 0:
             break
+
+        # Check skeleton distance to detect branch crossings
+        if skeleton_dist is not None:
+            curr_skel_dist = float(skeleton_dist[iy, ix])
+            # If we suddenly jump far from skeleton, we likely crossed into a branch
+            if traveled > 0 and curr_skel_dist > max_skeleton_jump:
+                # Check if distance increased significantly (moved away from main fiber)
+                if prev_skel_dist is not None and curr_skel_dist > prev_skel_dist + max_skeleton_jump:
+                    break
+            prev_skel_dist = curr_skel_dist
+
         traveled += step
     end_yx = (max(0, min(height - 1, int(round(yy)))), max(0, min(width - 1, int(round(xx)))))
     return traveled, end_yx
@@ -249,6 +272,67 @@ def filter_width_outliers_iqr(widths: List[float], segments: List[Tuple[Tuple[in
     return filtered_widths, filtered_segments
 
 
+def compute_line_average_grayscale(
+    gray_image: np.ndarray,
+    endpoint1: Tuple[int, int],
+    endpoint2: Tuple[int, int],
+    min_grayscale: float,
+    mean_grayscale: float
+) -> float:
+    """
+    Compute average grayscale value along a line segment.
+    This replicates the C++ logic from image_utils.cpp:1091-1106.
+
+    Args:
+        gray_image: Grayscale image (H, W)
+        endpoint1: First endpoint as (y, x)
+        endpoint2: Second endpoint as (y, x)
+        min_grayscale: Minimum grayscale from entire image
+        mean_grayscale: Mean grayscale from entire image
+
+    Returns:
+        Average grayscale value along the line
+    """
+    try:
+        if gray_image is None or gray_image.size == 0:
+            return (min_grayscale + mean_grayscale) / 2.0
+
+        height, width = gray_image.shape[:2]
+
+        # Use cv2.LineIterator equivalent - we'll manually create line points
+        # OpenCV's LineIterator in Python can be complex, so we use a simpler approach
+        y1, x1 = int(endpoint1[0]), int(endpoint1[1])
+        y2, x2 = int(endpoint2[0]), int(endpoint2[1])
+
+        # Get all points along the line using Bresenham-like algorithm
+        num_points = int(max(abs(x2 - x1), abs(y2 - y1))) + 1
+        if num_points <= 1:
+            if 0 <= y1 < height and 0 <= x1 < width:
+                return float(gray_image[y1, x1])
+            else:
+                return (min_grayscale + mean_grayscale) / 2.0
+
+        xs = np.linspace(x1, x2, num_points)
+        ys = np.linspace(y1, y2, num_points)
+
+        total_gray = 0.0
+        valid_pixel_count = 0
+
+        for x, y in zip(xs, ys):
+            ix, iy = int(round(x)), int(round(y))
+            if 0 <= ix < width and 0 <= iy < height:
+                total_gray += float(gray_image[iy, ix])
+                valid_pixel_count += 1
+
+        if valid_pixel_count > 0:
+            return total_gray / valid_pixel_count
+        else:
+            return (min_grayscale + mean_grayscale) / 2.0
+    except Exception as e:
+        # Return default value on any error
+        return (min_grayscale + mean_grayscale) / 2.0
+
+
 def check_width_gradient(widths: List[float], segments: List[Tuple[Tuple[int, int], Tuple[int, int]]],
                          gradient_threshold: float = 1.8) -> Tuple[List[float], List[Tuple[Tuple[int, int], Tuple[int, int]]]]:
     """
@@ -288,6 +372,9 @@ def check_width_gradient(widths: List[float], segments: List[Tuple[Tuple[int, in
 
 def measure_widths_for_mask(
     binary_mask: np.ndarray,
+    original_image: Optional[np.ndarray] = None,
+    min_grayscale: float = 0.0,
+    mean_grayscale: float = 128.0,
     sample_stride: int = 2,
     pca_radius: int = 7,
     max_cast_steps: int = 4096,
@@ -295,15 +382,23 @@ def measure_widths_for_mask(
     filter_outliers: bool = True,
     skip_junctions: bool = True,
     check_gradient: bool = True,
+    check_branch_crossing: bool = True,
+    max_skeleton_jump: float = 3.0,
 ) -> Tuple[List[float], List[Tuple[Tuple[int, int], Tuple[int, int]]], np.ndarray]:
     """
     Measure perpendicular widths densely along the skeleton.
-    Returns a list of widths and the corresponding line segments ((y1,x1),(y2,x2)).
+    Returns lists of widths and corresponding line segments ((y1,x1),(y2,x2)).
+    Note: Does NOT compute intensity factors for each point - that should be done separately for the max width point only.
 
     Args:
+        original_image: Original grayscale/color image for intensity-based scaling (optional)
+        min_grayscale: Minimum grayscale value from the entire image
+        mean_grayscale: Mean grayscale value from the entire image
         filter_outliers: Apply IQR-based outlier filtering
         skip_junctions: Skip measurements near skeleton junction points (crossings)
         check_gradient: Filter measurements with sudden width changes
+        check_branch_crossing: Stop ray casting when crossing into branches
+        max_skeleton_jump: Max distance from skeleton before stopping (for branch detection)
     """
     skeleton = morphological_skeletonize(binary_mask)
     # Optionally pruned upstream via CLI flags in main; this function expects already-pruned mask
@@ -313,6 +408,12 @@ def measure_widths_for_mask(
 
     # Detect junction points to avoid measuring at fiber crossings
     junction_mask = detect_junction_points(skeleton) if skip_junctions else np.zeros_like(skeleton, dtype=np.uint8)
+
+    # Compute distance transform from skeleton for branch crossing detection
+    skeleton_dist = None
+    if check_branch_crossing:
+        skeleton_binary = (skeleton > 0).astype(np.uint8)
+        skeleton_dist = cv2.distanceTransform(skeleton_binary, cv2.DIST_L2, 3).astype(np.float32)
 
     height, width = binary_mask.shape[:2]
     widths: List[float] = []
@@ -340,10 +441,12 @@ def measure_widths_for_mask(
         normal /= n_norm
 
         dist_pos, end_pos = cast_to_boundary(
-            binary_mask, (float(cy), float(cx)), normal, max_steps=max_cast_steps, step=cast_step
+            binary_mask, (float(cy), float(cx)), normal, max_steps=max_cast_steps, step=cast_step,
+            skeleton_dist=skeleton_dist, max_skeleton_jump=max_skeleton_jump
         )
         dist_neg, end_neg = cast_to_boundary(
-            binary_mask, (float(cy), float(cx)), -normal, max_steps=max_cast_steps, step=cast_step
+            binary_mask, (float(cy), float(cx)), -normal, max_steps=max_cast_steps, step=cast_step,
+            skeleton_dist=skeleton_dist, max_skeleton_jump=max_skeleton_jump
         )
 
         width_px = dist_pos + dist_neg
@@ -355,10 +458,42 @@ def measure_widths_for_mask(
 
     # Apply post-processing filters
     if check_gradient and len(widths) >= 3:
-        widths, segments = check_width_gradient(widths, segments)
+        filtered_indices = []
+        widths_np = np.array(widths, dtype=np.float32)
+
+        for i in range(len(widths)):
+            neighbors = []
+            if i > 0:
+                neighbors.append(widths_np[i-1])
+            if i < len(widths) - 1:
+                neighbors.append(widths_np[i+1])
+
+            if len(neighbors) == 0:
+                filtered_indices.append(i)
+                continue
+
+            neighbor_median = np.median(neighbors)
+            if widths[i] <= 1.8 * neighbor_median:  # Using default gradient_threshold
+                filtered_indices.append(i)
+
+        widths = [widths[i] for i in filtered_indices]
+        segments = [segments[i] for i in filtered_indices]
 
     if filter_outliers and len(widths) >= 4:
-        widths, segments = filter_width_outliers_iqr(widths, segments)
+        widths_np = np.array(widths, dtype=np.float32)
+        q1 = np.percentile(widths_np, 25)
+        q3 = np.percentile(widths_np, 75)
+        iqr = q3 - q1
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+
+        filtered_indices = []
+        for i, w in enumerate(widths):
+            if lower_bound <= w <= upper_bound:
+                filtered_indices.append(i)
+
+        widths = [widths[i] for i in filtered_indices]
+        segments = [segments[i] for i in filtered_indices]
 
     return widths, segments, points
 
@@ -461,8 +596,13 @@ def main() -> None:
     parser.add_argument("--no-skip-junctions", dest="skip_junctions", action="store_false", help="Disable junction skipping")
     parser.add_argument("--check-gradient", action="store_true", default=True, help="Filter sudden width changes")
     parser.add_argument("--no-check-gradient", dest="check_gradient", action="store_false", help="Disable gradient checking")
+    parser.add_argument("--check-branch-crossing", action="store_true", default=True, help="Stop ray at branch crossings using skeleton distance")
+    parser.add_argument("--no-check-branch-crossing", dest="check_branch_crossing", action="store_false", help="Disable branch crossing check")
     parser.add_argument("--iqr-multiplier", type=float, default=1.5, help="IQR multiplier for outlier detection (default: 1.5)")
     parser.add_argument("--gradient-threshold", type=float, default=1.8, help="Gradient threshold for sudden width changes (default: 1.8)")
+    parser.add_argument("--max-skeleton-jump", type=float, default=3.0, help="Max skeleton distance jump for branch detection (default: 3.0)")
+    parser.add_argument("--original-image-dir", type=str, default=None,
+                        help="Directory containing original images for intensity-based width scaling")
 
     args = parser.parse_args()
 
@@ -473,7 +613,7 @@ def main() -> None:
     output_dir = os.path.abspath(output_dir)
 
     os.makedirs(output_dir, exist_ok=True)
-    vis_dir = os.path.join(output_dir, "vis")
+    vis_dir = os.path.join(output_dir, "vis_scaled")
     os.makedirs(vis_dir, exist_ok=True)
 
     files = list_image_files(input_dir)
@@ -481,127 +621,231 @@ def main() -> None:
         print(f"No images found in: {input_dir}")
         return
 
-    csv_path = os.path.join(output_dir, args.csv_name)
-    with open(csv_path, "w", newline="") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(["file", "max_width_px", "mean_width_px", "median_width_px", "std_width_px", "num_samples"]) 
+    # Collect all results in memory first to avoid I/O bottleneck
+    csv_rows = []
+    csv_rows.append(["file", "max_width_px", "max_width_scaled", "intensity_factor_at_max",
+                    "mean_width_px", "median_width_px", "std_width_px", "num_samples"])
 
-        for idx, path in enumerate(files, start=1):
+    for idx, path in enumerate(files, start=1):
+        try:
+            mask = read_binary_mask(path, args.binary_thresh)
+            if mask is None or mask.size == 0:
+                print(f"[{idx}/{len(files)}] {os.path.basename(path)} -> ERROR: Empty mask")
+                csv_rows.append([os.path.basename(path), 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0])
+                continue
+
+            # Load original image for intensity-based scaling (if provided)
+            original_image = None
+            min_grayscale = 0.0
+            mean_grayscale = 128.0
+
+            if args.original_image_dir:
+                # Extract original image filename from mask filename
+                # Mask format: "20250708_152402_0.png" -> Original: "20250708_152402.png"
+                mask_basename = os.path.basename(path)
+                mask_name_no_ext = os.path.splitext(mask_basename)[0]
+
+                # Remove the last "_N" suffix to get the original image name
+                if '_' in mask_name_no_ext:
+                    parts = mask_name_no_ext.rsplit('_', 1)  # Split from right, only once
+                    # Check if the last part is a number (the fiber index)
+                    if len(parts) == 2 and parts[1].isdigit():
+                        original_name = parts[0]
+
+                        # Try to find matching original image with various extensions
+                        for ext in ['png', 'jpg', 'jpeg', 'bmp', 'tif', 'tiff', 'PNG', 'JPG', 'JPEG', 'BMP', 'TIF', 'TIFF']:
+                            orig_path = os.path.join(args.original_image_dir, f"{original_name}.{ext}")
+                            if os.path.exists(orig_path):
+                                original_image = cv2.imread(orig_path, cv2.IMREAD_GRAYSCALE)
+                                if original_image is not None:
+                                    # Calculate global statistics (replicate C++ logic from mainwindow.cpp:1153-1167)
+                                    mean_grayscale = float(original_image.mean())
+                                    min_grayscale = float(original_image.min())
+                                    break
+
+                        if original_image is None:
+                            print(f"Warning: Could not find original image for {mask_basename} (expected: {original_name}.*)")
+                    else:
+                        print(f"Warning: Mask filename {mask_basename} does not match expected format (name_index.ext)")
+                else:
+                    print(f"Warning: Mask filename {mask_basename} does not contain underscore separator")
+
+            # Skeletonize
+            skeleton = morphological_skeletonize(mask)
+            if args.prune:
+                skeleton = prune_skeleton_branches(skeleton, args.prune_min_length)
+
+            skel_points = get_skeleton_points(skeleton)
+            if skel_points.shape[0] == 0:
+                print(f"[{idx}/{len(files)}] {os.path.basename(path)} -> no samples")
+                csv_rows.append([os.path.basename(path), 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0])
+                continue
+
+            # Measure widths (without intensity factors for performance)
+            widths, segments, points = measure_widths_for_mask(
+                mask,
+                original_image=original_image,
+                min_grayscale=min_grayscale,
+                mean_grayscale=mean_grayscale,
+                sample_stride=args.sample_stride,
+                pca_radius=args.pca_radius,
+                max_cast_steps=args.max_cast_steps,
+                cast_step=args.cast_step,
+                filter_outliers=args.filter_outliers,
+                skip_junctions=args.skip_junctions,
+                check_gradient=args.check_gradient,
+                check_branch_crossing=args.check_branch_crossing,
+                max_skeleton_jump=args.max_skeleton_jump
+            )
+
+
+            if len(widths) == 0:
+                print(f"[{idx}/{len(files)}] {os.path.basename(path)} -> no samples")
+                csv_rows.append([os.path.basename(path), 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0])
+                continue
+
+            widths_np = np.array(widths, dtype=np.float32)
+
+            # Find max width point
+            max_i = int(np.argmax(widths_np))
+            max_width = float(widths_np[max_i])
+            max_segment = segments[max_i]
+
+            # Compute intensity factor ONLY for the max width point
+            intensity_factor_at_max = 1.0
+            max_width_scaled = max_width
+
+            if original_image is not None:
+                # Prepare grayscale image
+                try:
+                    if len(original_image.shape) == 3:
+                        gray_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2GRAY)
+                    else:
+                        gray_image = original_image.copy()
+
+                    # Resize if needed
+                    if gray_image.shape[:2] != mask.shape[:2]:
+                        gray_image = cv2.resize(gray_image, (mask.shape[1], mask.shape[0]),
+                                               interpolation=cv2.INTER_LINEAR)
+
+                    # Compute average grayscale along the max width line
+                    end_neg, end_pos = max_segment
+                    avg_grayscale = compute_line_average_grayscale(
+                        gray_image, end_neg, end_pos, min_grayscale, mean_grayscale
+                    )
+
+                    # Map grayscale to 2.0-3.0 range
+                    if mean_grayscale > min_grayscale:
+                        intensity_factor_at_max = 2.0 + (mean_grayscale - avg_grayscale) / (mean_grayscale - min_grayscale)
+                        intensity_factor_at_max = max(2.0, min(3.0, intensity_factor_at_max))
+                    else:
+                        intensity_factor_at_max = 2.5
+
+                    max_width_scaled = max_width * intensity_factor_at_max
+
+                    del gray_image
+                except Exception as e:
+                    print(f"Warning: Failed to compute intensity factor: {e}")
+                    intensity_factor_at_max = 1.0
+                    max_width_scaled = max_width
+
+            # Other statistics (only on pixel widths, not scaled)
+            mean_width = float(widths_np.mean())
+            median_width = float(np.median(widths_np))
+            std_width = float(widths_np.std(ddof=0))
+
+            # Filter out by maximum width threshold (skip visualization and CSV)
+            if max_width > float(args.max_width_thresh):
+                # print(
+                #     f"[{idx}/{len(files)}] {os.path.basename(path)} -> filtered (max_width {max_width:.2f}px > {args.max_width_thresh:.2f}px)"
+                # )
+                continue
+
+            # Skip visualization to reduce memory usage and disk I/O
+            # This helps prevent segmentation faults
+            if args.save_skeleton:
+                try:
+                    vis_path = os.path.join(vis_dir, os.path.splitext(os.path.basename(path))[0] + "_vis.png")
+                    visualize_widest(
+                        mask,
+                        segments[max_i],
+                        vis_path,
+                        skeleton_points=skel_points,
+                        point_radius=args.skeleton_radius,
+                        width_px=max_width,
+                    )
+                except Exception as e:
+                    print(f"Warning: Failed to create visualization for {os.path.basename(path)}: {e}")
+
+            # Append to in-memory list instead of writing to disk
+            csv_rows.append([
+                os.path.basename(path),
+                f"{max_width:.3f}",
+                f"{max_width_scaled:.3f}",
+                f"{intensity_factor_at_max:.3f}",
+                f"{mean_width:.3f}",
+                f"{median_width:.3f}",
+                f"{std_width:.3f}",
+                len(widths),
+            ])
+
+            print(
+                f"[{idx}/{len(files)}] {os.path.basename(path)} -> max={max_width:.2f}px, samples={len(widths)}"
+            )
+
+            # Explicitly delete large objects to free memory
             try:
-                mask = read_binary_mask(path, args.binary_thresh)
-                # Skeletonize
-                skeleton = morphological_skeletonize(mask)
-                if args.prune:
-                    skeleton = prune_skeleton_branches(skeleton, args.prune_min_length)
+                del mask, skeleton, skel_points, widths, segments, points, widths_np
+            except:
+                pass
+            try:
+                if original_image is not None:
+                    del original_image
+            except:
+                pass
 
-                # Measure using the (optionally pruned) skeleton
-                # Temporarily reuse the measurement function by passing the same mask, but replacing
-                # skeletonization step's output below
-                # Compute points from the prepared skeleton
-                skel_points = get_skeleton_points(skeleton)
-                if skel_points.shape[0] == 0:
-                    print(f"[{idx}/{len(files)}] {os.path.basename(path)} -> no samples")
-                    writer.writerow([os.path.basename(path), 0.0, 0.0, 0.0, 0.0, 0])
-                    continue
+            # Periodic garbage collection
+            if idx % 50 == 0:
+                import gc
+                gc.collect()
 
-                # Measure widths on the prepared skeleton by calling the core logic directly
-                # Duplicate a minimal portion of measure logic to avoid re-skeletonizing
-                widths: List[float] = []
-                segments: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
-                points = skel_points
-                height, width_img = mask.shape[:2]
+        except Exception as e:
+            print(f"[{idx}/{len(files)}] {os.path.basename(path)} -> ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+            # Clean up on error
+            try:
+                del mask, skeleton, skel_points, original_image
+            except:
+                pass
+            try:
+                del widths, segments, points
+            except:
+                pass
 
-                order = np.lexsort((points[:, 1], points[:, 0]))
-                points = points[order]
-
-                # Detect junction points to avoid measuring at fiber crossings
-                junction_mask = detect_junction_points(skeleton) if args.skip_junctions else np.zeros_like(skeleton, dtype=np.uint8)
-
-                for pidx in range(0, points.shape[0], max(1, int(args.sample_stride))):
-                    cy, cx = points[pidx]
-
-                    # Skip if this point is near a junction (crossing)
-                    if args.skip_junctions and junction_mask[cy, cx] > 0:
-                        continue
-
-                    tangent = estimate_tangent_from_neighbors(points, pidx, args.pca_radius)
-                    if tangent is None:
-                        continue
-                    normal = np.array([-tangent[1], tangent[0]], dtype=np.float32)
-                    n_norm = float(np.linalg.norm(normal))
-                    if n_norm == 0.0:
-                        continue
-                    normal /= n_norm
-
-                    dist_pos, end_pos = cast_to_boundary(
-                        mask, (float(cy), float(cx)), normal, max_steps=args.max_cast_steps, step=args.cast_step
-                    )
-                    dist_neg, end_neg = cast_to_boundary(
-                        mask, (float(cy), float(cx)), -normal, max_steps=args.max_cast_steps, step=args.cast_step
-                    )
-
-                    width_px = dist_pos + dist_neg
-                    if width_px <= 0.0:
-                        continue
-
-                    widths.append(width_px)
-                    segments.append((end_neg, end_pos))
-
-                # Apply post-processing filters
-                if args.check_gradient and len(widths) >= 3:
-                    widths, segments = check_width_gradient(widths, segments, gradient_threshold=args.gradient_threshold)
-
-                if args.filter_outliers and len(widths) >= 4:
-                    widths, segments = filter_width_outliers_iqr(widths, segments, iqr_multiplier=args.iqr_multiplier)
-                
-
-                if len(widths) == 0:
-                    print(f"[{idx}/{len(files)}] {os.path.basename(path)} -> no samples")
-                    writer.writerow([os.path.basename(path), 0.0, 0.0, 0.0, 0.0, 0])
-                    continue
-
-                widths_np = np.array(widths, dtype=np.float32)
-                max_i = int(np.argmax(widths_np))
-                max_width = float(widths_np[max_i])
-                mean_width = float(widths_np.mean())
-                median_width = float(np.median(widths_np))
-                std_width = float(widths_np.std(ddof=0))
-
-                # Filter out by maximum width threshold (skip visualization and CSV)
-                if max_width > float(args.max_width_thresh):
-                    # print(
-                    #     f"[{idx}/{len(files)}] {os.path.basename(path)} -> filtered (max_width {max_width:.2f}px > {args.max_width_thresh:.2f}px)"
-                    # )
-                    continue
-
-                # Visualize widest segment (optionally overlay skeleton points) in the same file
-                vis_path = os.path.join(vis_dir, os.path.splitext(os.path.basename(path))[0] + "_vis.png")
-                visualize_widest(
-                    mask,
-                    segments[max_i],
-                    vis_path,
-                    skeleton_points=skel_points if args.save_skeleton else None,
-                    point_radius=args.skeleton_radius,
-                    width_px=max_width,
-                )
-
-                writer.writerow([
-                    os.path.basename(path),
-                    f"{max_width:.3f}",
-                    f"{mean_width:.3f}",
-                    f"{median_width:.3f}",
-                    f"{std_width:.3f}",
-                    len(widths),
-                ])
-
-                print(
-                    f"[{idx}/{len(files)}] {os.path.basename(path)} -> max={max_width:.2f}px, samples={len(widths)}"
-                )
-            except Exception as e:
-                print(f"[{idx}/{len(files)}] {os.path.basename(path)} -> ERROR: {e}")
+    # Write all results to CSV at once (avoid I/O bottleneck)
+    print(f"\nWriting {len(csv_rows)} rows to CSV...")
+    csv_path = os.path.join(output_dir, args.csv_name)
+    try:
+        with open(csv_path, "w", newline="") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerows(csv_rows)
+        print(f"Successfully wrote CSV to {csv_path}")
+    except Exception as e:
+        print(f"ERROR: Failed to write CSV: {e}")
+        raise
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        # Force cleanup of OpenCV resources
+        import gc
+        gc.collect()
+        # Note: cv2.destroyAllWindows() removed - can cause segfault
+        # Exit cleanly
+        import sys
+        sys.exit(0)
 
 
