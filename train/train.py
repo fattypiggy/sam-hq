@@ -25,8 +25,9 @@ from torch.utils.tensorboard import SummaryWriter
 from segment_anything_training import sam_model_registry
 from segment_anything_training.modeling import TwoWayTransformer, MaskDecoder
 
-from utils.dataloader import get_im_gt_name_dict, get_im_instance_name_dict, create_dataloaders, RandomHFlip, Resize, LargeScaleJitter
-from utils.loss_mask import loss_masks
+from utils.dataloader import get_im_gt_name_dict, get_im_instance_name_dict, create_dataloaders, RandomHFlip, Resize, LargeScaleJitter, AddSkeletonTransform
+from utils.loss_mask import loss_masks, loss_masks_with_skeleton
+from utils.cldice import batch_compute_cldice
 import utils.misc as misc
 
 class LayerNorm2d(nn.Module):
@@ -365,6 +366,14 @@ def get_args_parser():
     parser.add_argument('--instance', action='store_true',
                         help='Enable instance-level training/evaluation: each instance mask file is a separate sample. Expects multiple mask files per image: <basename>_<instId><gt_ext>.')
 
+    # Skeleton Recall Loss parameters
+    parser.add_argument('--use-skeleton-loss', action='store_true',
+                        help='Enable Skeleton Recall Loss for connectivity preservation')
+    parser.add_argument('--skeleton-loss-weight', default=1.0, type=float,
+                        help='Weight for skeleton recall loss (default: 1.0, paper recommends 0.1 or 1.0)')
+    parser.add_argument('--skeleton-tube-radius', default=2, type=int,
+                        help='Radius for skeleton tube dilation (default: 2 as in paper)')
+
     return parser.parse_args()
 
 
@@ -404,21 +413,34 @@ def main(net, train_datasets, valid_datasets, args):
     if not args.eval:
         print("--- create training dataloader ---")
         train_im_gt_list = (get_im_instance_name_dict if args.instance else get_im_gt_name_dict)(train_datasets, flag="train")
+
+        # Build training transforms
+        train_transforms = [
+            RandomHFlip(),
+            LargeScaleJitter()
+        ]
+        # Add skeleton transform if skeleton loss is enabled
+        if args.use_skeleton_loss:
+            print(f"[Skeleton Loss] Enabled with weight={args.skeleton_loss_weight}, tube_radius={args.skeleton_tube_radius}")
+            train_transforms.append(AddSkeletonTransform(do_tube=True, tube_radius=args.skeleton_tube_radius))
+
         train_dataloaders, train_datasets = create_dataloaders(train_im_gt_list,
-                                                        my_transforms = [
-                                                                    RandomHFlip(),
-                                                                    LargeScaleJitter()
-                                                                    ],
-                                                        batch_size = args.batch_size_train,
-                                                        training = True)
+                                                        my_transforms=train_transforms,
+                                                        batch_size=args.batch_size_train,
+                                                        training=True)
         print(len(train_dataloaders), " train dataloaders created")
 
     print("--- create valid dataloader ---")
     valid_im_gt_list = (get_im_instance_name_dict if args.instance else get_im_gt_name_dict)(valid_datasets, flag="valid")
+
+    # Build validation transforms
+    valid_transforms = [Resize(args.input_size)]
+    # Add skeleton transform for validation if skeleton loss is enabled
+    if args.use_skeleton_loss:
+        valid_transforms.append(AddSkeletonTransform(do_tube=True, tube_radius=args.skeleton_tube_radius))
+
     valid_dataloaders, valid_datasets = create_dataloaders(valid_im_gt_list,
-                                                          my_transforms = [
-                                                                        Resize(args.input_size)
-                                                                    ],
+                                                          my_transforms=valid_transforms,
                                                           batch_size=args.batch_size_valid,
                                                           training=False)
     print(len(valid_dataloaders), " valid dataloaders created")
@@ -477,12 +499,16 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
         local_step = 0
         for data in metric_logger.log_every(train_dataloaders,1000):
             inputs, labels = data['image'], data['label']
+            skeletons = data.get('skeleton', None)  # Get skeleton if available
+
             if torch.cuda.is_available():
                 inputs = inputs.cuda()
                 labels = labels.cuda()
+                if skeletons is not None:
+                    skeletons = skeletons.cuda()
 
             imgs = inputs.permute(0, 2, 3, 1).cpu().numpy()
-            
+
             # input prompt
             input_keys = ['box','point','noise_mask']
             labels_box = misc.masks_to_boxes(labels[:,0,:,:])
@@ -498,7 +524,7 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
             for b_i in range(len(imgs)):
                 dict_input = dict()
                 input_image = torch.as_tensor(imgs[b_i].astype(dtype=np.uint8), device=sam.device).permute(2, 0, 1).contiguous()
-                dict_input['image'] = input_image 
+                dict_input['image'] = input_image
                 input_type = random.choice(input_keys)
                 if input_type == 'box':
                     dict_input['boxes'] = labels_box[b_i:b_i+1]
@@ -515,7 +541,7 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
 
             with torch.no_grad():
                 batched_output, interm_embeddings = sam(batched_input, multimask_output=False)
-            
+
             batch_len = len(batched_output)
             encoder_embedding = torch.cat([batched_output[i_l]['encoder_embedding'] for i_l in range(batch_len)], dim=0)
             image_pe = [batched_output[i_l]['image_pe'] for i_l in range(batch_len)]
@@ -532,10 +558,18 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
                 interm_embeddings=interm_embeddings,
             )
 
-            loss_mask, loss_dice = loss_masks(masks_hq, labels/255.0, len(masks_hq))
-            loss = loss_mask + loss_dice
-            
-            loss_dict = {"loss_mask": loss_mask, "loss_dice":loss_dice}
+            # Compute loss with skeleton if enabled
+            if args.use_skeleton_loss and skeletons is not None:
+                loss_mask, loss_dice, loss_skeleton = loss_masks_with_skeleton(
+                    masks_hq, labels/255.0, skeletons/255.0, len(masks_hq),
+                    weight_skeleton=args.skeleton_loss_weight
+                )
+                loss = loss_mask + loss_dice + loss_skeleton
+                loss_dict = {"loss_mask": loss_mask, "loss_dice": loss_dice, "loss_skeleton": loss_skeleton}
+            else:
+                loss_mask, loss_dice = loss_masks(masks_hq, labels/255.0, len(masks_hq))
+                loss = loss_mask + loss_dice
+                loss_dict = {"loss_mask": loss_mask, "loss_dice": loss_dice}
 
             # reduce losses over all GPUs for logging purposes
             loss_dict_reduced = misc.reduce_dict(loss_dict)
@@ -554,19 +588,24 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
                     writer.add_scalar('train/loss', loss_value, global_step)
                     writer.add_scalar('train/loss_mask', float(loss_mask.detach().item()), global_step)
                     writer.add_scalar('train/loss_dice', float(loss_dice.detach().item()), global_step)
+                    if args.use_skeleton_loss and 'loss_skeleton' in loss_dict:
+                        writer.add_scalar('train/loss_skeleton', float(loss_dict['loss_skeleton'].detach().item()), global_step)
                     writer.add_scalar('train/lr', float(optimizer.param_groups[0]["lr"]), global_step)
                 if metrics_jsonl_path is not None:
                     try:
+                        metrics_payload = {
+                            "type": "train_step",
+                            "epoch": int(epoch),
+                            "step": int(global_step),
+                            "loss": float(loss_value),
+                            "loss_mask": float(loss_mask.detach().item()),
+                            "loss_dice": float(loss_dice.detach().item()),
+                            "lr": float(optimizer.param_groups[0]["lr"]),
+                        }
+                        if args.use_skeleton_loss and 'loss_skeleton' in loss_dict:
+                            metrics_payload["loss_skeleton"] = float(loss_dict['loss_skeleton'].detach().item())
                         with open(metrics_jsonl_path, 'a', encoding='utf-8') as jf:
-                            jf.write(json.dumps({
-                                "type": "train_step",
-                                "epoch": int(epoch),
-                                "step": int(global_step),
-                                "loss": float(loss_value),
-                                "loss_mask": float(loss_mask.detach().item()),
-                                "loss_dice": float(loss_dice.detach().item()),
-                                "lr": float(optimizer.param_groups[0]["lr"]),
-                            }) + "\n")
+                            jf.write(json.dumps(metrics_payload) + "\n")
                     except Exception:
                         pass
             local_step += 1
@@ -654,11 +693,14 @@ def evaluate(args, net, sam, valid_dataloaders, visualize=False, writer: Optiona
 
         for data_val in metric_logger.log_every(valid_dataloader,1000):
             imidx_val, inputs_val, labels_val, shapes_val, labels_ori = data_val['imidx'], data_val['image'], data_val['label'], data_val['shape'], data_val['ori_label']
+            skeletons_val = data_val.get('skeleton', None)
 
             if torch.cuda.is_available():
                 inputs_val = inputs_val.cuda()
                 labels_val = labels_val.cuda()
                 labels_ori = labels_ori.cuda()
+                if skeletons_val is not None:
+                    skeletons_val = skeletons_val.cuda()
 
             imgs = inputs_val.permute(0, 2, 3, 1).cpu().numpy()
             
@@ -703,14 +745,44 @@ def evaluate(args, net, sam, valid_dataloaders, visualize=False, writer: Optiona
             iou = compute_iou(masks_for_eval,labels_ori)
             boundary_iou = compute_boundary_iou(masks_for_eval,labels_ori)
 
+            # Compute clDice metric for connectivity evaluation
+            # Resize predictions to match original label size for fair comparison
+            if masks_for_eval.shape[-2:] != labels_ori.shape[-2:]:
+                masks_for_eval_resized = F.interpolate(
+                    masks_for_eval,
+                    size=labels_ori.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False
+                )
+            else:
+                masks_for_eval_resized = masks_for_eval
+
+            # Binarize predictions (threshold at 0)
+            masks_for_eval_binary = (masks_for_eval_resized > 0).float()
+            cldice = batch_compute_cldice(masks_for_eval_binary, labels_ori)
+
             # Compute a validation loss consistent with training
             # Resize labels to match masks_for_eval spatially
             if masks_for_eval.shape[-2:] != labels_val.shape[-2:]:
                 labels_resized = F.interpolate(labels_val, size=masks_for_eval.shape[-2:], mode='bilinear', align_corners=False)
+                if skeletons_val is not None:
+                    skeletons_resized = F.interpolate(skeletons_val, size=masks_for_eval.shape[-2:], mode='bilinear', align_corners=False)
+                else:
+                    skeletons_resized = None
             else:
                 labels_resized = labels_val
-            val_loss_mask, val_loss_dice = loss_masks(masks_for_eval, labels_resized/255.0, len(masks_for_eval))
-            val_loss = val_loss_mask + val_loss_dice
+                skeletons_resized = skeletons_val
+
+            # Compute validation loss with skeleton if enabled
+            if args.use_skeleton_loss and skeletons_resized is not None:
+                val_loss_mask, val_loss_dice, val_loss_skeleton = loss_masks_with_skeleton(
+                    masks_for_eval, labels_resized/255.0, skeletons_resized/255.0, len(masks_for_eval),
+                    weight_skeleton=args.skeleton_loss_weight
+                )
+                val_loss = val_loss_mask + val_loss_dice + val_loss_skeleton
+            else:
+                val_loss_mask, val_loss_dice = loss_masks(masks_for_eval, labels_resized/255.0, len(masks_for_eval))
+                val_loss = val_loss_mask + val_loss_dice
 
             if visualize:
                 print("visualize")
@@ -766,7 +838,12 @@ def evaluate(args, net, sam, valid_dataloaders, visualize=False, writer: Optiona
                         save_composite_instances(ori_path, [masks_vis_full[ii, 0]], save_path)
                        
 
-            loss_dict = {"val_iou_"+str(k): iou, "val_boundary_iou_"+str(k): boundary_iou, "val_loss_"+str(k): val_loss}
+            loss_dict = {
+                "val_iou_"+str(k): iou,
+                "val_boundary_iou_"+str(k): boundary_iou,
+                "val_cldice_"+str(k): cldice,
+                "val_loss_"+str(k): val_loss
+            }
             loss_dict_reduced = misc.reduce_dict(loss_dict)
             metric_logger.update(**loss_dict_reduced)
 
@@ -796,14 +873,13 @@ if __name__ == "__main__":
 
     args = get_args_parser()
 
-    src_root = "./data/fiber"
-    src_im_dir = os.path.join(src_root, "images")
-    src_gt_dir = os.path.join(src_root, "masks")
+    # Updated paths
+    src_im_dir = "/home/wei/datasets/fiber/USDA/data"
+    src_gt_dir = "/home/wei/GitHub/sam-hq/train/data/fiber/masks"
+    src_inst_dir = "/home/wei/GitHub/sam-hq/train/data/fiber/masks_inst"
     im_ext = ".jpg"
     gt_ext = ".png"
     dst_root = "./data/fiber_split"
-
-    src_inst_dir = os.path.join(src_root, "masks_inst")
 
     train_im_dir, train_gt_dir, val_im_dir, val_gt_dir, train_inst_dir, val_inst_dir = misc.split_and_copy_dataset(
         src_im_dir=src_im_dir,
