@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 设置基础目录
-BASE_DIR=~/Datasets/fiber
+BASE_DIR=~/Datasets/fiber_new
 
 # 遍历所有子文件夹
 for dir in "$BASE_DIR"/*/ ; do

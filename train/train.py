@@ -340,8 +340,8 @@ def get_args_parser():
     parser.add_argument('--visualize', action='store_true')
     parser.add_argument("--restore-model", type=str,
                         help="The path to the hq_decoder training checkpoint for evaluation")
-    parser.add_argument('--vis-branch', type=str, default='auto', choices=['auto','sam','hq'],
-                        help="Which branch to visualize: 'sam' for baseline SAM, 'hq' for HQ mask, 'auto' uses 'hq' only when restore-model is provided, otherwise 'sam'.")
+    parser.add_argument('--vis-branch', type=str, default='auto', choices=['auto','sam','hq','vanilla'],
+                        help="Which branch to visualize: 'vanilla' for original SAM (no HQ decoder), 'sam' for HQ decoder SAM branch, 'hq' for HQ mask, 'auto' uses 'hq' only when restore-model is provided, otherwise 'sam'.")
 
     # Optional overrides for training/eval dataset directories and file extensions
     parser.add_argument('--train-im-dir', type=str, default=None,
@@ -468,9 +468,25 @@ def main(net, train_datasets, valid_datasets, args):
         if args.restore_model:
             print("restore model from:", args.restore_model)
             if torch.cuda.is_available():
-                net_without_ddp.load_state_dict(torch.load(args.restore_model))
+                checkpoint = torch.load(args.restore_model)
             else:
-                net_without_ddp.load_state_dict(torch.load(args.restore_model,map_location="cpu"))
+                checkpoint = torch.load(args.restore_model, map_location="cpu")
+
+            # Check if this is a full model checkpoint (with 'mask_decoder.' prefix) or just decoder weights
+            if any(k.startswith('mask_decoder.') for k in checkpoint.keys()):
+                # Full SAM-HQ model - extract only the mask_decoder part
+                print("Loading from full SAM-HQ model checkpoint")
+                decoder_state_dict = {}
+                for k, v in checkpoint.items():
+                    if k.startswith('mask_decoder.'):
+                        # Remove 'mask_decoder.' prefix
+                        new_key = k.replace('mask_decoder.', '')
+                        decoder_state_dict[new_key] = v
+                net_without_ddp.load_state_dict(decoder_state_dict)
+            else:
+                # Decoder-only checkpoint
+                print("Loading from decoder-only checkpoint")
+                net_without_ddp.load_state_dict(checkpoint)
     
         evaluate(args, net, sam, valid_dataloaders, args.visualize, writer)
 
@@ -728,19 +744,29 @@ def evaluate(args, net, sam, valid_dataloaders, visualize=False, writer: Optiona
             sparse_embeddings = [batched_output[i_l]['sparse_embeddings'] for i_l in range(batch_len)]
             dense_embeddings = [batched_output[i_l]['dense_embeddings'] for i_l in range(batch_len)]
             
-            masks_sam, masks_hq = net(
-                image_embeddings=encoder_embedding,
-                image_pe=image_pe,
-                sparse_prompt_embeddings=sparse_embeddings,
-                dense_prompt_embeddings=dense_embeddings,
-                multimask_output=False,
-                hq_token_only=False,
-                interm_embeddings=interm_embeddings,
-            )
-
-            # Choose branch for metrics and visualization
+            # Determine which masks to use for evaluation
+            # vanilla: use SAM's own mask decoder output (from batched_output)
+            # sam: use HQ decoder's SAM branch
+            # hq/auto: use HQ decoder's HQ branch
+            use_vanilla_sam = (args.vis_branch == 'vanilla')
             use_hq = (args.vis_branch == 'hq') or (args.vis_branch == 'auto' and args.restore_model is not None)
-            masks_for_eval = masks_hq if use_hq else masks_sam
+
+            if use_vanilla_sam:
+                # Use vanilla SAM masks directly from SAM model output
+                # Convert boolean masks to float for consistent processing
+                masks_for_eval = torch.cat([batched_output[i_l]['masks'] for i_l in range(batch_len)], dim=0).float()
+            else:
+                # Use HQ decoder output
+                masks_sam, masks_hq = net(
+                    image_embeddings=encoder_embedding,
+                    image_pe=image_pe,
+                    sparse_prompt_embeddings=sparse_embeddings,
+                    dense_prompt_embeddings=dense_embeddings,
+                    multimask_output=False,
+                    hq_token_only=False,
+                    interm_embeddings=interm_embeddings,
+                )
+                masks_for_eval = masks_hq if use_hq else masks_sam
 
             iou = compute_iou(masks_for_eval,labels_ori)
             boundary_iou = compute_boundary_iou(masks_for_eval,labels_ori)

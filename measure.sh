@@ -1,6 +1,8 @@
+BASE_DIR="$HOME/Datasets/fiber_new/A01-029 1-1"
 python tools/measure_binary_instance_widths.py \
---input-dir test/test_results_64_iou0.6_stable0.925_vit_l_island3000_hole100_area2000-Oct1-8/binary_mask_instance \
---output-dir measurement_results-Oct-1-3 \
+--input-dir "$BASE_DIR/binary_mask_instance" \
+--output-dir $BASE_DIR \
+--original-image-dir $BASE_DIR \
 --csv-name widths.csv \
 --binary-thresh 127 \
 --sample-stride 2 \

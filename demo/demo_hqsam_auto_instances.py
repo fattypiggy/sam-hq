@@ -144,6 +144,7 @@ def main():
     parser.add_argument("--max-instance-area-ratio", type=float, default=0.1, help="Filter out instances with area ratio > value (default: 0.1 = 10% of image)")
     parser.add_argument("--overlap-thresh", type=float, default=0.5, help="Overlap threshold for removing overlapping masks (0.0-1.0)")
     parser.add_argument("--resume-index", type=int, default=1, help="1-based index of image to start processing (skip previous images)")
+    parser.add_argument("--max-images", type=int, default=None, help="Maximum number of images to process (default: process all)")
 
     args = parser.parse_args()
 
@@ -194,11 +195,17 @@ def main():
         image_paths.append(args.input)
 
     total_images = len(image_paths)
+    processed_count = 0
     for idx, img_path in enumerate(image_paths, start=1):
         if idx < max(1, int(args.resume_index)):
             continue
+        # Check if we've reached max_images limit
+        if args.max_images is not None and processed_count >= args.max_images:
+            print(f"Reached max_images limit ({args.max_images}), stopping.")
+            break
+        processed_count += 1
         if args.overlap_thresh > 0.0:
-            print(f"Processing image {idx}/{total_images}: {os.path.basename(img_path)}")
+            print(f"Processing image {processed_count}/{min(args.max_images, total_images) if args.max_images else total_images}: {os.path.basename(img_path)}")
 
         bgr = cv2.imread(img_path)
         if bgr is None:

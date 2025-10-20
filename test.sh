@@ -2,8 +2,8 @@ python demo/demo_hqsam_auto_instances.py \
 --checkpoint train/pretrained_checkpoint/sam_vit_l_0b3195.pth \
 --restore-model train/ckpts/vit_l_loss.pth \
 --model-type vit_l \
---input ~/Datasets/fiber/A01-029 1-1/ \
---output ~/Datasets/fiber/A01-029 1-1/ \
+--input "$HOME/Datasets/fiber_new/STD-04 1-1" \
+--output "$HOME/Datasets/fiber_new/STD-04 1-1" \
 --device cuda \
 --points-per-side 64 \
 --pred-iou-thresh 0.6 \
