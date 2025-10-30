@@ -734,12 +734,15 @@ def main() -> None:
                         gray_image, end_neg, end_pos, min_grayscale, mean_grayscale
                     )
 
-                    # Map grayscale to 2.0-3.0 range
+                    # Map grayscale to 2.0-π range
                     if mean_grayscale > min_grayscale:
-                        intensity_factor_at_max = 2.0 + (mean_grayscale - avg_grayscale) / (mean_grayscale - min_grayscale)
-                        intensity_factor_at_max = max(2.0, min(3.0, intensity_factor_at_max))
+                        # Scale factor from 0 to 1 based on darkness (darker = higher factor)
+                        normalized_darkness = (mean_grayscale - avg_grayscale) / (mean_grayscale - min_grayscale)
+                        # Map to [2.0, π] range
+                        intensity_factor_at_max = 2.0 + (math.pi - 2.0) * normalized_darkness
+                        intensity_factor_at_max = max(2.0, min(math.pi, intensity_factor_at_max))
                     else:
-                        intensity_factor_at_max = 2.5
+                        intensity_factor_at_max = (2.0 + math.pi) / 2.0  # midpoint
 
                     max_width_scaled = max_width * intensity_factor_at_max
 
